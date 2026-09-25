@@ -1,0 +1,18 @@
+[Unit]
+Description=Statime PTPv1 follower for Inferno DVS on %i
+Documentation=https://github.com/teodly/statime/tree/inferno-dev
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+RuntimeDirectory=inferno-dvs
+RuntimeDirectoryPreserve=yes
+ExecStartPre=@BINDIR@/inferno-dvs-ctl statime-config %i /run/inferno-dvs/statime-%i.toml
+ExecStart=@LIBEXECDIR@/inferno-dvs/statime -c /run/inferno-dvs/statime-%i.toml
+Restart=on-failure
+RestartSec=2
+Nice=-10
+
+[Install]
+WantedBy=multi-user.target

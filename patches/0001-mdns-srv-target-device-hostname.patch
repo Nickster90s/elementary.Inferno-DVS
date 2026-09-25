@@ -1,0 +1,83 @@
+diff --git a/inferno_aoip/src/device_server/mdns_server.rs b/inferno_aoip/src/device_server/mdns_server.rs
+index beed25e..811b52d 100644
+--- a/inferno_aoip/src/device_server/mdns_server.rs
++++ b/inferno_aoip/src/device_server/mdns_server.rs
+@@ -106,6 +106,9 @@ impl DeviceMDNSResponder {
+       let name =
+         Name::from_labels([format!("{}@{}", ch_name, self_info.friendly_hostname).as_bytes()]).unwrap();
+       let mut b = ServiceBuilder::new(service_type("_netaudio-chan"), name, self_info.flows_control_port)
++        .unwrap()
++        // SRV must point at the device's host, not "<channel>@<device>.local"
++        .hostname(Name::from_labels([self_info.friendly_hostname.as_bytes()]).unwrap())
+         .unwrap()
+         .add_ip_address(IpAddr::V4(self_info.ip_address))
+         .add_txt_truncated("txtvers=2")
+@@ -180,6 +183,8 @@ impl DeviceMDNSResponder {
+       Name::from_labels([format!("{}@{}", bundle_id, self_info.friendly_hostname).as_bytes()]).unwrap();
+     let handle = self.handle.read().unwrap();
+     let service = ServiceBuilder::new(service_type("_netaudio-bund"), name, self_info.flows_control_port)
++      .unwrap()
++      .hostname(Name::from_labels([self_info.friendly_hostname.as_bytes()]).unwrap())
+       .unwrap()
+       .add_ip_address(IpAddr::V4(self_info.ip_address))
+       .add_txt_truncated("txtvers=1")
+diff --git a/searchfire/src/broadcast.rs b/searchfire/src/broadcast.rs
+index c0ed848..6a22775 100644
+--- a/searchfire/src/broadcast.rs
++++ b/searchfire/src/broadcast.rs
+@@ -183,6 +183,9 @@ impl Broadcaster {
+ 			};
+ 
+ 			for query in message.queries() {
++				// Many services (e.g. one per audio channel) share one host name;
++				// answer a host-name (A/AAAA) query with just one of them.
++				let mut host_answered = false;
+ 				for service in config.read().unwrap().services.iter().filter(|service| {
+ 					if service.service_type() == query.name() {
+ 						return true;
+@@ -190,6 +193,10 @@ impl Broadcaster {
+ 					if service.service_id() == query.name() {
+ 						return true;
+ 					}
++					if service.service_hostname() == query.name() && !host_answered {
++						host_answered = true;
++						return true;
++					}
+ 
+ 					if let Some(subtype_suffix) = &service.service_subtype_suffix {
+ 						if query.name().to_utf8().ends_with(subtype_suffix) {
+diff --git a/searchfire/src/broadcast/service.rs b/searchfire/src/broadcast/service.rs
+index a483fc7..f16bac0 100644
+--- a/searchfire/src/broadcast/service.rs
++++ b/searchfire/src/broadcast/service.rs
+@@ -162,6 +162,12 @@ impl Service {
+ 		&self.service_name
+ 	}
+ 
++	#[inline(always)]
++	/// The host name the SRV record points at (and the A/AAAA records are for).
++	pub fn service_hostname(&self) -> &DnsName {
++		&self.service_hostname
++	}
++
+ 	#[inline(always)]
+ 	/// The service id (FQDN from name to .local)
+ 	pub fn service_id(&self) -> &DnsName {
+@@ -348,6 +354,17 @@ impl ServiceBuilder {
+ 		}))
+ 	}
+ 
++	/// Sets the host name (without `.local`) the SRV target and address
++	/// records use. Defaults to the service name, which is only right when the
++	/// service name is also a valid host name. Services such as Dante channels
++	/// (`<channel>@<device>`) must point at the device's host name instead.
++	pub fn hostname(mut self, host: impl IntoDnsName) -> Result<Self, BadDnsNameError> {
++		let local = DnsName::from_labels(["local"]).unwrap();
++		let host = host.into_name().map_err(|_| BadDnsNameError)?;
++		self.0.service_hostname = host.append_domain(&local).map_err(|_| BadDnsNameError)?;
++		Ok(self)
++	}
++
+ 	/// Sets the TTL of the service.
+ 	pub fn ttl(mut self, ttl: u32) -> Self {
+ 		self.0.ttl = ttl;

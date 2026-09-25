@@ -1,0 +1,617 @@
+#!/usr/bin/env python3
+"""inferno-dvs-ctl: control helper for the Inferno virtual soundcard.
+
+Shared by the GUI, the Wingpanel indicator and the systemd units. Python 3
+standard library only.
+
+  interfaces              list usable NICs          (keyfile on stdout)
+  status                  current state             (keyfile on stdout)
+  start | stop | restart  bring the soundcard (PipeWire nodes) up / down
+  setup                   one-time per-user setup (units, PipeWire override)
+  clock-on | clock-off    enable/disable the PTP daemon (asks admin password)
+  pw-up | pw-down         used by inferno-dvs.service (user unit)
+  set KEY=VALUE...        change config.ini
+  autostart on|off        start with the session
+  default output|input on|off   use as the system default sink/source
+  statime-config IF OUT   used by inferno-statime@.service (runs as root)
+
+The per-user config lives in ~/.config/inferno-dvs/config.ini.
+"""
+
+import configparser
+import json
+import os
+import socket
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+HOME = Path.home()
+XDG_CONFIG = Path(os.environ.get("XDG_CONFIG_HOME", HOME / ".config"))
+CONF_DIR = XDG_CONFIG / "inferno-dvs"
+CONF_FILE = CONF_DIR / "config.ini"
+ALSA_CONF = CONF_DIR / "asound.conf"
+ALSA_USER_RC = XDG_CONFIG / "alsa" / "asoundrc"
+
+PREFIX = Path(__file__).resolve().parent.parent
+PLUGIN_SO = "libasound_module_pcm_inferno.so"
+# meson's libdir is multiarch on Debian/Ubuntu (lib/x86_64-linux-gnu).
+PLUGIN_CANDIDATES = [
+    p for base in (PREFIX, Path("/usr/local"), Path("/usr"))
+    for p in [base / "lib" / "inferno-dvs" / PLUGIN_SO,
+              *sorted(base.glob(f"lib/*/inferno-dvs/{PLUGIN_SO}"))]
+]
+STATIME_BIN_CANDIDATES = [
+    PREFIX / "libexec" / "inferno-dvs" / "statime",
+    Path("/usr/local/libexec/inferno-dvs/statime"),
+    Path("/usr/libexec/inferno-dvs/statime"),
+]
+
+RUN_DIR = Path("/run/inferno-dvs")
+OBSERVE_SOCK = RUN_DIR / "statime.sock"
+USRVCLOCK_SOCK = "/tmp/ptp-usrvclock"
+
+PCM_NAME = "inferno_dvs"
+USER_UNIT = "inferno-dvs.service"
+STATIME_UNIT = "inferno-statime@{}.service"
+
+DEFAULTS = {
+    "name": "",
+    "interface": "",
+    "rx_channels": "8",
+    "tx_channels": "8",
+    "sample_rate": "48000",
+    "latency_ms": "4",
+    "autostart": "false",
+}
+SAMPLE_RATES = (44100, 48000, 88200, 96000)
+MAX_CHANNELS = 128
+
+SKIP_IF_PREFIX = ("lo", "docker", "veth", "br-", "virbr", "tun", "tap", "wg")
+
+
+# ---------------------------------------------------------------- helpers
+
+def run(*cmd, check=False, capture=True):
+    return subprocess.run(cmd, check=check, text=True,
+                          stdout=subprocess.PIPE if capture else None,
+                          stderr=subprocess.PIPE if capture else None)
+
+
+def emit(section, values):
+    """Print a GLib.KeyFile-compatible group."""
+    print(f"[{section}]")
+    for k, v in values.items():
+        v = str(v).replace("\n", " ")
+        print(f"{k}={v}")
+    print()
+
+
+def load_config():
+    cp = configparser.ConfigParser()
+    cp["device"] = dict(DEFAULTS)
+    cp.read(CONF_FILE)
+    d = cp["device"]
+    cfg = {k: d.get(k, v) for k, v in DEFAULTS.items()}
+    if not cfg["interface"]:
+        ifs = list_interfaces()
+        up = [i for i in ifs if i["ipv4"]]
+        cfg["interface"] = (up or ifs or [{"name": ""}])[0]["name"]
+    if not cfg["name"]:
+        cfg["name"] = default_name()
+    return cfg
+
+
+def validated(cfg):
+    out = dict(cfg)
+    for key in ("rx_channels", "tx_channels"):
+        n = int(out[key])
+        if not 0 <= n <= MAX_CHANNELS:
+            raise ValueError(f"{key} must be 0..{MAX_CHANNELS}")
+        out[key] = n
+    out["sample_rate"] = int(out["sample_rate"])
+    if out["sample_rate"] not in SAMPLE_RATES:
+        raise ValueError(f"sample_rate must be one of {SAMPLE_RATES}")
+    out["latency_ms"] = float(out["latency_ms"])
+    if not 0.25 <= out["latency_ms"] <= 40:
+        raise ValueError("latency_ms must be 0.25..40")
+    name = "".join(c for c in out["name"] if c.isalnum() or c == "-")[:31]
+    out["name"] = name or default_name()
+    return out
+
+
+def default_name():
+    host = socket.gethostname().split(".")[0]
+    host = "".join(c for c in host if c.isalnum() or c == "-")
+    return (host or "linux")[:24] + "-DVS"
+
+
+def list_interfaces():
+    ifs = []
+    for p in sorted(Path("/sys/class/net").iterdir()):
+        name = p.name
+        if name.startswith(SKIP_IF_PREFIX):
+            continue
+        try:
+            mac = (p / "address").read_text().strip()
+            oper = (p / "operstate").read_text().strip()
+        except OSError:
+            continue
+        wireless = (p / "wireless").exists()
+        ifs.append({"name": name, "mac": mac, "state": oper,
+                    "wireless": wireless, "ipv4": ipv4_of(name)})
+    return ifs
+
+
+def ipv4_of(ifname):
+    r = run("ip", "-4", "-o", "addr", "show", "dev", ifname)
+    for line in r.stdout.splitlines():
+        parts = line.split()
+        if "inet" in parts:
+            return parts[parts.index("inet") + 1].split("/")[0]
+    return ""
+
+
+def mac_of(ifname):
+    try:
+        return Path(f"/sys/class/net/{ifname}/address").read_text().strip()
+    except OSError:
+        return ""
+
+
+def device_id(ifname):
+    # Real Dante devices use the MAC address padded with zeros.
+    mac = mac_of(ifname).replace(":", "")
+    return (mac + "0000").lower() if len(mac) == 12 else ""
+
+
+def systemctl(*args, user=False):
+    cmd = ["systemctl"] + (["--user"] if user else []) + list(args)
+    return run(*cmd)
+
+
+def find_existing(candidates):
+    for c in candidates:
+        if c.exists():
+            return c
+    return candidates[0]
+
+
+# ---------------------------------------------------------------- ALSA
+
+def write_alsa_conf(cfg):
+    # INFERNO_DVS_PLUGIN: developer override, e.g. a fresh cargo build.
+    plugin = os.environ.get("INFERNO_DVS_PLUGIN") or find_existing(PLUGIN_CANDIDATES)
+    lat_ns = int(cfg["latency_ms"] * 1_000_000)
+    body = f"""# Generated by inferno-dvs-ctl. Edit via the Inferno DVS app.
+pcm_type.inferno {{
+	lib "{plugin}"
+}}
+
+pcm.{PCM_NAME} {{
+	type inferno
+	NAME "{cfg['name']}"
+	DEVICE_ID "{device_id(cfg['interface'])}"
+	BIND_IP "{cfg['interface']}"
+	SAMPLE_RATE "{cfg['sample_rate']}"
+	RX_CHANNELS "{cfg['rx_channels']}"
+	TX_CHANNELS "{cfg['tx_channels']}"
+	RX_LATENCY_NS "{lat_ns}"
+	TX_LATENCY_NS "{lat_ns}"
+	CLOCK_PATH "{USRVCLOCK_SOCK}"
+	hint {{
+		show on
+		description "Inferno DVS"
+	}}
+}}
+"""
+    CONF_DIR.mkdir(parents=True, exist_ok=True)
+    ALSA_CONF.write_text(body)
+
+    include = f"<{ALSA_CONF}>"
+    ALSA_USER_RC.parent.mkdir(parents=True, exist_ok=True)
+    existing = ALSA_USER_RC.read_text() if ALSA_USER_RC.exists() else ""
+    if include not in existing:
+        with ALSA_USER_RC.open("a") as f:
+            f.write(f"\n# Inferno DVS virtual soundcard\n{include}\n")
+
+
+# ---------------------------------------------------------------- PipeWire
+
+def pw_dump():
+    """pw-dump sometimes appends a second JSON array (a live update) after
+    the first; json.loads() then fails with 'Extra data'. Decode each array
+    in turn and let later entries override earlier ones by id."""
+    text = run("pw-dump").stdout or ""
+    dec = json.JSONDecoder()
+    objs, pos = {}, 0
+    while True:
+        while pos < len(text) and text[pos].isspace():
+            pos += 1
+        if pos >= len(text):
+            break
+        try:
+            chunk, pos = dec.raw_decode(text, pos)
+        except json.JSONDecodeError:
+            break
+        for o in chunk if isinstance(chunk, list) else []:
+            if o.get("info") is None and o["id"] in objs:
+                continue          # removal / partial update: keep last full
+            objs[o["id"]] = o
+    return list(objs.values())
+
+
+def pw_nodes():
+    objs = pw_dump()
+    out = []
+    for o in objs:
+        props = (o.get("info") or {}).get("props") or {}
+        if props.get("api.alsa.path") == PCM_NAME:
+            out.append({"id": o["id"],
+                        "name": props.get("node.name", ""),
+                        "class": props.get("media.class", ""),
+                        "state": (o.get("info") or {}).get("state", "")})
+    return out
+
+
+def pw_up():
+    cfg = validated(load_config())
+    write_alsa_conf(cfg)
+    pw_down()
+    common = (f'object.linger=true api.alsa.path="{PCM_NAME}" '
+              f'api.alsa.pcm.card=999 api.alsa.headroom=128 '
+              f'audio.rate={cfg["sample_rate"]} '
+              'session.suspend-timeout-seconds=0 node.pause-on-idle=false '
+              'node.suspend-on-idle=false node.always-process=true')
+    label = cfg["name"]
+    if cfg["rx_channels"] > 0:
+        # Dante RX = audio *from* the network = a PipeWire source (capture).
+        run("pw-cli", "create-node", "adapter",
+            "{ factory.name=api.alsa.pcm.source node.name=inferno_dvs_source "
+            f'node.description="{label} (Dante in, {cfg["rx_channels"]} ch)" '
+            f"media.class=Audio/Source {common} }}", check=True)
+    if cfg["tx_channels"] > 0:
+        run("pw-cli", "create-node", "adapter",
+            "{ factory.name=api.alsa.pcm.sink node.name=inferno_dvs_sink "
+            f'node.description="{label} (Dante out, {cfg["tx_channels"]} ch)" '
+            f"media.class=Audio/Sink {common} }}", check=True)
+    # pw-cli exits 0 even when the ALSA device fails to open; check for real.
+    want = (cfg["rx_channels"] > 0) + (cfg["tx_channels"] > 0)
+    for _ in range(20):
+        if len(pw_nodes()) >= want:
+            return
+        time.sleep(0.25)
+    raise ValueError("Inferno PipeWire nodes did not appear; "
+                     "see: journalctl --user -u pipewire")
+
+
+def default_node_name(which):
+    r = run("wpctl", "inspect", f"@DEFAULT_AUDIO_{which}@")
+    for line in r.stdout.splitlines():
+        line = line.strip().lstrip("* ")
+        if line.startswith("node.name"):
+            return line.split("=", 1)[1].strip().strip('"')
+    return ""
+
+
+def node_id_by_name(name):
+    for o in pw_dump():
+        props = (o.get("info") or {}).get("props") or {}
+        if props.get("node.name") == name:
+            return o["id"]
+    return None
+
+
+def set_default(kind, on):
+    """kind: 'output' (our sink) or 'input' (our source).
+
+    Turning it on remembers the previous default so turning it off can
+    restore it; otherwise WirePlumber's configured default is cleared and it
+    picks the best hardware device again.
+    """
+    which = "SINK" if kind == "output" else "SOURCE"
+    ours = "inferno_dvs_sink" if kind == "output" else "inferno_dvs_source"
+    prev_file = CONF_DIR / f"previous-default-{kind}"
+    if on:
+        oid = node_id_by_name(ours)
+        if oid is None:
+            raise ValueError("the soundcard is not running")
+        prev = default_node_name(which)
+        if prev and prev != ours:
+            CONF_DIR.mkdir(parents=True, exist_ok=True)
+            prev_file.write_text(prev)
+        run("wpctl", "set-default", str(oid), check=True)
+        return
+    prev = prev_file.read_text().strip() if prev_file.exists() else ""
+    pid = node_id_by_name(prev) if prev else None
+    if pid is not None:
+        run("wpctl", "set-default", str(pid), check=True)
+    else:
+        # wpctl clear-default index: 0 = audio sink, 1 = audio source
+        run("wpctl", "clear-default", "0" if kind == "output" else "1")
+
+
+def pw_down():
+    for n in pw_nodes():
+        run("pw-cli", "destroy", str(n["id"]))
+
+
+# ---------------------------------------------------------------- statime
+
+def statime_config(ifname, out_path):
+    body = f"""# Generated by inferno-dvs-ctl for inferno-statime@{ifname}.service
+loglevel = "info"
+sdo-id = 0
+domain = 0
+priority1 = 251
+virtual-system-clock = true
+virtual-system-clock-base = "monotonic_raw"
+usrvclock-export = true
+usrvclock-path = "{USRVCLOCK_SOCK}"
+
+[observability]
+observation-path = "{OBSERVE_SOCK}"
+observation-permissions = 0o666
+
+[[port]]
+interface = "{ifname}"
+network-mode = "ipv4"
+hardware-clock = "auto"
+protocol-version = "PTPv1"
+"""
+    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+    Path(out_path).write_text(body)
+
+
+def statime_units_enabled_or_active():
+    units = set(statime_units_active())
+    r = systemctl("list-unit-files", "--plain", "--no-legend",
+                  "--state=enabled", "inferno-statime@*")
+    units.update(line.split()[0] for line in r.stdout.splitlines()
+                 if line.strip() and "@." not in line.split()[0])
+    r = systemctl("list-units", "--plain", "--no-legend", "--all",
+                  "inferno-statime@*")
+    for line in r.stdout.splitlines():
+        parts = line.split()
+        if len(parts) > 2 and parts[2] in ("active", "activating"):
+            units.add(parts[0])
+    return sorted(units)
+
+
+def statime_units_active():
+    r = systemctl("list-units", "--plain", "--no-legend", "--state=active",
+                  "inferno-statime@*")
+    return [line.split()[0] for line in r.stdout.splitlines() if line.strip()]
+
+
+def observe():
+    """Read one JSON snapshot from statime's observation socket."""
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(1.0)
+        s.connect(str(OBSERVE_SOCK))
+        chunks = []
+        while True:
+            b = s.recv(65536)
+            if not b:
+                break
+            chunks.append(b)
+        s.close()
+        return json.loads(b"".join(chunks))
+    except (OSError, ValueError):
+        return None
+
+
+def _first_key(v):
+    if isinstance(v, dict) and v:
+        return next(iter(v))
+    return v
+
+
+def _nanos(v):
+    """Statime serialises Durations in a few shapes; normalise to ns."""
+    if v is None:
+        return None
+    if isinstance(v, int):
+        return v / 2**32          # statime Duration = I96F32 fixed-point ns
+    if isinstance(v, float):
+        return v
+    if isinstance(v, dict):
+        for k in ("nanos", "ns", "inner"):
+            if k in v:
+                return _nanos(v[k])
+        if "secs" in v:
+            return float(v["secs"]) * 1e9 + float(v.get("nanos", 0))
+    if isinstance(v, str):
+        try:
+            return float(v)
+        except ValueError:
+            return None
+    return None
+
+
+def ptp_status():
+    snap = observe()
+    if not snap:
+        return {"ptp_state": "unavailable"}
+    inst = snap.get("instance") or {}
+    ports = inst.get("port_ds") or []
+    state = _first_key(ports[0].get("port_state")) if ports else "unknown"
+    cur = inst.get("current_ds") or {}
+    parent = inst.get("parent_ds") or {}
+    gm = parent.get("grandmaster_identity") or parent.get("parent_port_identity") or ""
+    if isinstance(gm, dict):
+        gm = gm.get("clock_identity", gm)
+    if isinstance(gm, list):
+        gm = "".join(f"{b:02x}" for b in gm)
+    elif isinstance(gm, dict):
+        gm = json.dumps(gm)
+    off = _nanos(cur.get("offset_from_master"))
+    delay = _nanos(cur.get("mean_delay"))
+    return {
+        "ptp_state": str(state).lower(),
+        "ptp_offset_ns": "" if off is None else f"{off:.0f}",
+        "ptp_delay_ns": "" if delay is None else f"{delay:.0f}",
+        "ptp_leader": gm,
+    }
+
+
+# ---------------------------------------------------------------- commands
+
+def cmd_interfaces():
+    for i in list_interfaces():
+        emit(i["name"], {"mac": i["mac"], "state": i["state"],
+                         "ipv4": i["ipv4"],
+                         "wireless": str(i["wireless"]).lower()})
+
+
+def cmd_status():
+    cfg = load_config()
+    active = systemctl("is-active", USER_UNIT, user=True).stdout.strip()
+    statime = statime_units_active()
+    nodes = pw_nodes()
+    node_state = ",".join(sorted({n["state"] for n in nodes})) or "absent"
+    info = {
+        "running": str(active == "active" and bool(nodes)).lower(),
+        "service": active,
+        "statime": ",".join(statime) or "inactive",
+        "nodes": len(nodes),
+        "node_state": node_state,
+        "ip": ipv4_of(cfg["interface"]) if cfg["interface"] else "",
+        "autostart": str(systemctl("is-enabled", USER_UNIT, user=True)
+                         .stdout.strip() == "enabled").lower(),
+    }
+    info["default_output"] = str(default_node_name("SINK") == "inferno_dvs_sink").lower()
+    info["default_input"] = str(default_node_name("SOURCE") == "inferno_dvs_source").lower()
+    info.update(ptp_status() if statime else {"ptp_state": "stopped"})
+    emit("status", info)
+    emit("config", cfg)
+
+
+def clock_on():
+    """Enable the PTP daemon for the configured NIC (and only that one).
+
+    This is a system unit, so polkit asks for the admin password through the
+    desktop's authentication agent. It persists across reboots.
+    """
+    cfg = validated(load_config())
+    ifname = cfg["interface"]
+    if not ifname:
+        raise ValueError("no network interface configured")
+    want = STATIME_UNIT.format(ifname)
+    others = [u for u in statime_units_enabled_or_active() if u != want]
+    if others:
+        systemctl("disable", "--now", *others)
+    r = systemctl("enable", "--now", want)
+    if r.returncode:
+        raise ValueError(f"failed to enable {want}: {r.stderr.strip()}")
+
+
+def clock_off():
+    units = statime_units_enabled_or_active()
+    if units:
+        systemctl("disable", "--now", *units)
+
+
+def cmd_start():
+    validated(load_config())
+    r = systemctl("restart", USER_UNIT, user=True)
+    if r.returncode:
+        raise ValueError(f"failed to start {USER_UNIT}: {r.stderr.strip()}"
+                         " (see: journalctl --user -u inferno-dvs)")
+
+
+def cmd_stop():
+    systemctl("stop", USER_UNIT, user=True)
+
+
+def cmd_autostart(flag):
+    systemctl("enable" if flag == "on" else "disable", USER_UNIT, user=True)
+
+
+def cmd_setup():
+    """Per-user setup: allow clock syscalls in PipeWire's sandbox."""
+    drop = XDG_CONFIG / "systemd" / "user" / "pipewire.service.d"
+    drop.mkdir(parents=True, exist_ok=True)
+    f = drop / "inferno-dvs.conf"
+    want = "[Service]\nSystemCallFilter=@clock\n"
+    if not f.exists() or f.read_text() != want:
+        f.write_text(want)
+        systemctl("daemon-reload", user=True)
+        print("PipeWire sandbox override installed; restarting PipeWire")
+        systemctl("restart", "pipewire.service", "pipewire-pulse.service",
+                  "wireplumber.service", user=True)
+    CONF_DIR.mkdir(parents=True, exist_ok=True)
+    if not CONF_FILE.exists():
+        save_config(load_config())
+
+
+def save_config(cfg):
+    cp = configparser.ConfigParser()
+    cp["device"] = {k: str(cfg[k]) for k in DEFAULTS}
+    CONF_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = CONF_FILE.with_suffix(".tmp")
+    with tmp.open("w") as f:
+        cp.write(f)
+    tmp.replace(CONF_FILE)
+
+
+def cmd_set(pairs):
+    cfg = load_config()
+    for p in pairs:
+        k, _, v = p.partition("=")
+        if k not in DEFAULTS:
+            sys.exit(f"unknown key {k}")
+        cfg[k] = v
+    save_config(validated(cfg))
+
+
+def main(argv):
+    if not argv:
+        print(__doc__)
+        return 1
+    cmd, args = argv[0], argv[1:]
+    try:
+        if cmd == "interfaces":
+            cmd_interfaces()
+        elif cmd == "status":
+            cmd_status()
+        elif cmd == "start":
+            cmd_start()
+        elif cmd == "stop":
+            cmd_stop()
+        elif cmd == "restart":
+            cmd_stop()
+            time.sleep(0.5)
+            cmd_start()
+        elif cmd == "set":
+            cmd_set(args)
+        elif cmd == "autostart" and args and args[0] in ("on", "off"):
+            cmd_autostart(args[0])
+        elif cmd == "default" and len(args) == 2 and args[0] in ("output", "input") \
+                and args[1] in ("on", "off"):
+            set_default(args[0], args[1] == "on")
+        elif cmd == "setup":
+            cmd_setup()
+        elif cmd == "clock-on":
+            clock_on()
+        elif cmd == "clock-off":
+            clock_off()
+        elif cmd == "pw-up":
+            pw_up()
+        elif cmd == "pw-down":
+            pw_down()
+        elif cmd == "statime-config" and len(args) == 2:
+            statime_config(args[0], args[1])
+        else:
+            print(__doc__)
+            return 1
+    except (ValueError, subprocess.CalledProcessError) as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

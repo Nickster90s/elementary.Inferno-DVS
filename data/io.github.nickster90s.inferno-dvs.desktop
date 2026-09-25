@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Inferno DVS
+GenericName=Virtual Dante Soundcard
+Comment=Configure the Inferno virtual Dante soundcard (unofficial)
+Exec=io.github.nickster90s.inferno-dvs
+Icon=audio-card
+Terminal=false
+Categories=AudioVideo;Audio;Settings;
+Keywords=dante;aoip;inferno;ptp;soundcard;audio;network;
+StartupNotify=true

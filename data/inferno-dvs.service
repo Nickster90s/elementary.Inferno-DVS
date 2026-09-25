@@ -1,0 +1,13 @@
+[Unit]
+Description=Inferno DVS virtual Dante soundcard (PipeWire nodes)
+After=pipewire.service wireplumber.service
+BindsTo=pipewire.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=@BINDIR@/inferno-dvs-ctl pw-up
+ExecStop=@BINDIR@/inferno-dvs-ctl pw-down
+
+[Install]
+WantedBy=pipewire.service
