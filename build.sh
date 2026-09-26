@@ -30,17 +30,30 @@ mkdir -p "$here/deps"
 [ -n "${INFERNO_DIR:-}" ] || fetch "$INFERNO_URL" "$INFERNO_REV" "$inferno"
 [ -n "${STATIME_DIR:-}" ] || fetch "$STATIME_URL" "$STATIME_REV" "$statime"
 
-for p in "$here"/patches/*.patch; do
-    if git -C "$inferno" apply --check "$p" 2>/dev/null; then
+if [ -z "${INFERNO_DIR:-}" ]; then
+    # Our own checkout: start from the pinned commit every time, so changed
+    # patches never meet an older version of themselves.
+    git -C "$inferno" reset -q --hard "$INFERNO_REV"
+    git -C "$inferno" submodule -q foreach --recursive git reset -q --hard
+    git -C "$inferno" submodule -q update --init --recursive
+    for p in "$here"/patches/*.patch; do
         echo "applying $(basename "$p")"
         git -C "$inferno" apply "$p"
-    elif git -C "$inferno" apply --check --reverse "$p" 2>/dev/null; then
-        echo "already applied: $(basename "$p")"
-    else
-        echo "error: $(basename "$p") does not apply to $inferno" >&2
-        exit 1
-    fi
-done
+    done
+else
+    # Someone else's checkout: apply what is missing, never reset it.
+    for p in "$here"/patches/*.patch; do
+        if git -C "$inferno" apply --check "$p" 2>/dev/null; then
+            echo "applying $(basename "$p")"
+            git -C "$inferno" apply "$p"
+        elif git -C "$inferno" apply --check --reverse "$p" 2>/dev/null; then
+            echo "already applied: $(basename "$p")"
+        else
+            echo "error: $(basename "$p") does not apply to $inferno" >&2
+            exit 1
+        fi
+    done
+fi
 
 (cd "$inferno" && "$cargo" build --release -p alsa_pcm_inferno)
 (cd "$statime" && "$cargo" build --release -p statime-linux)
