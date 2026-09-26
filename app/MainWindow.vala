@@ -327,7 +327,7 @@ public class InfernoDvs.MainWindow : Gtk.ApplicationWindow {
                 return i;
             }
         }
-        return 3;
+        return 5; // 1024
     }
 
     private uint index_of_latency (double ms) {

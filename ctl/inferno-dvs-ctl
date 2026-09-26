@@ -70,7 +70,7 @@ DEFAULTS = {
     "tx_ts_offset_us": "-100",
     # PipeWire buffer (quantum) the Inferno nodes ask for, in samples at the
     # Dante sample rate. This is local latency on top of the Dante latency.
-    "pw_quantum": "256",
+    "pw_quantum": "1024",
     "autostart": "false",
 }
 SAMPLE_RATES = (44100, 48000, 88200, 96000)

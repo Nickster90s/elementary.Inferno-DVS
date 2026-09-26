@@ -46,7 +46,7 @@ things (patch `0002`, plus the helper):
 |---|---|---|
 | Send/receive threads | asks for SCHED_FIFO, which fails silently for desktop users, so they run at normal priority | realtime via **RealtimeKit** (RR 20, like PipeWire's own data thread) |
 | Packet timestamp offset | fixed −500 µs | **−93 µs**, set with `tx_ts_offset_us` |
-| PipeWire buffer | graph default (1024 samples at 48 kHz, resampled) | **256 samples at the Dante rate**, 32–1024 selectable |
+| PipeWire buffer | graph default (1024 samples at 48 kHz, resampled) | **1024 samples at the Dante rate** (10.7 ms at 96 kHz), 32–1024 selectable |
 
 Measured on 2026-09-26 at 96 kHz. The receiver was an ESP32-P4 Dante-compatible
 DAC that timestamps packet arrival against a hardware PTP clock:
@@ -208,7 +208,9 @@ inferno-dvs-ctl interfaces                  # NICs it can use
   Dante Controller.
 - **Occasional clicks**: raise the latency or the PipeWire buffer. Check
   `journalctl --user -u pipewire | grep lag` for how late packets arrive.
-  From DVS you need about 4 ms. Inferno's
+  From DVS you need about 4 ms. `XRUN` lines there mean the PipeWire buffer
+  is too small for your apps: raise it (desktop apps such as Spotify or a
+  browser need 1024; pro-audio apps can go lower). Inferno's
   README has tuning tips (`cyclictest`, `isolcpus`, PREEMPT_RT).
 - **A receiver shows the patch green but plays nothing**: power-cycle the
   receiver. We saw a RedNet AM2 get stuck after its source device had
