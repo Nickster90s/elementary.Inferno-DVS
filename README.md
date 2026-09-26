@@ -237,7 +237,7 @@ verified against Controller and against RedNet AM2/A16R and DVS captures:
 | Set latency 0x1101 | ignored | applied (see below) |
 | Sample rate | "does not support sample rate configuration" | 44.1/48/88.2/96 kHz offered and settable |
 | Clock status 0x20 | fixed seq/opcode that Controller ignores | DVS layout, echoing seq/opcode: PTPv1 follower, leader, frequency offset |
-| Heartbeat | 0x8001–0x8003 | adds 0x8000 sync quality (offset and path delay from Statime) and 0x8004 |
+| Heartbeat | 0x8001–0x8003 (0x8002 = per-channel meters, already in upstream) | adds 0x8000 sync quality (offset and path delay from Statime) and 0x8004 |
 | 0x2204, 0x2032, 0x4100, unknown opcodes | no reply, so Controller retries | answered as an AM2 does (0x22 = unsupported) |
 | Restart race | a device reopened within a second panicked with "address in use" | waits for the previous instance to release its ports |
 
@@ -270,7 +270,6 @@ to searchfire, and uses them for channels and multicast bundles.
 - Changing latency or sample rate from Dante Controller restarts the Inferno
   device, so audio drops for a few seconds, much like a hardware device
   re-locking. PipeWire apps keep their streams.
-- Meters in Dante Controller are not shown yet.
 
 ## License
 
