@@ -1,0 +1,45 @@
+#!/usr/bin/env python3
+"""Measure how late a realtime thread wakes up on this machine.
+
+It runs one thread at realtime priority (through RealtimeKit, as Inferno and
+PipeWire do) that sleeps 333 us in a loop, like Inferno's send thread at
+96 kHz, and reports how late each wake-up was. Stalls longer than your Dante
+latency setting mean dropped packets, whatever the software does.
+
+  tools/rt-latency-check [seconds]      (default 60)
+"""
+import ctypes, os, resource, subprocess, sys, time
+
+secs = float(sys.argv[1]) if len(sys.argv) > 1 else 60
+resource.setrlimit(resource.RLIMIT_RTTIME, (200000, 200000))
+tid = ctypes.CDLL(None).syscall(186)  # gettid (x86_64)
+r = subprocess.run(["busctl", "--system", "call", "org.freedesktop.RealtimeKit1",
+                    "/org/freedesktop/RealtimeKit1", "org.freedesktop.RealtimeKit1",
+                    "MakeThreadRealtimeWithPID", "ttu", str(os.getpid()), str(tid), "20"],
+                   capture_output=True, text=True)
+if r.returncode:
+    print("warning: could not get realtime priority:", r.stderr.strip())
+period = 333e-6
+edges = [50, 100, 250, 500, 1000]
+hist = [0] * 6
+stalls = []
+worst = 0.0
+n = 0
+end = time.monotonic() + secs
+print(f"measuring for {secs:g} s ...")
+while (t := time.monotonic()) < end:
+    time.sleep(period)
+    late = (time.monotonic() - t - period) * 1e6
+    n += 1
+    worst = max(worst, late)
+    hist[next((i for i, e in enumerate(edges) if late < e), 5)] += 1
+    if late > 1000:
+        stalls.append((time.strftime("%T"), round(late)))
+print(f"{n} wake-ups, worst {worst:.0f} us")
+print("  <50us {} <100 {} <250 {} <500 {} <1ms {} >=1ms {}".format(*hist))
+if stalls:
+    print(f"stalls over 1 ms ({len(stalls)}):", ", ".join(f"{t} {us}us" for t, us in stalls[:12]))
+    print("Keep the Dante latency above the worst stall, or reduce the stalls "
+          "(see README, 'System stalls').")
+else:
+    print("no stalls over 1 ms")

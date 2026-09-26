@@ -74,6 +74,26 @@ Notes:
   (`sudo ethtool --set-eee eno1 eee off`). Audinate recommends this for
   Dante; on this bench it made no measurable difference.
 
+### System stalls
+
+Even at realtime priority, a thread can only be as punctual as the kernel
+lets it be. On the test machine (Ubuntu kernel with the default *voluntary*
+preemption), every realtime thread, not just Inferno's, was held off for
+about **3 ms** every 5–10 seconds. `tools/rt-latency-check` measures this on
+your machine.
+
+Inferno DVS keeps going through such a stall and sends the backlog, so it is
+inaudible when the receivers' latency is larger than the stall. With a lower
+latency, those one or two packets are dropped, which can be a tiny click
+every few seconds. To get rid of the stalls themselves:
+
+- boot with **`preempt=full`**: add it to `GRUB_CMDLINE_LINUX_DEFAULT` in
+  `/etc/default/grub`, run `sudo update-grub` and reboot. This is what
+  Ubuntu's low-latency kernel does.
+- keep the journal quiet. Statime now logs warnings only; Inferno logs at
+  `info` unless `RUST_LOG` is set.
+- check the BIOS for C-state and power-saving options if stalls remain.
+
 ## How it works
 
 ```
