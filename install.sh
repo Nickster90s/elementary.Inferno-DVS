@@ -10,7 +10,8 @@ sudo rm -f /usr/local/libexec/inferno-dvs/statime
 sudo meson install -C "$here/build"
 # ALSA caches loaded plugins by name, so only a PipeWire restart loads the
 # new one. inferno-dvs.service is bound to pipewire and comes back with it.
-if systemctl --user -q is-active inferno-dvs.service; then
+if systemctl --user -q is-active inferno-dvs.service ||
+   /usr/local/bin/inferno-dvs-ctl status 2>/dev/null | grep -q '^nodes=[1-9]'; then
     echo "Restarting PipeWire to load the new Inferno plugin (audio drops ~1 s)"
     systemctl --user restart pipewire.service pipewire-pulse.service wireplumber.service
     systemctl --user start inferno-dvs.service
