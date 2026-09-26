@@ -1,6 +1,7 @@
 public class InfernoDvs.MainWindow : Gtk.ApplicationWindow {
     private const int[] RATES = { 44100, 48000, 88200, 96000 };
-    private const double[] LATENCIES = { 1, 2, 4, 5, 6, 10, 20, 40 };
+    private const double[] LATENCIES = { 0.25, 0.5, 0.75, 1, 2, 4, 5, 6, 10, 20, 40 };
+    private const int[] QUANTA = { 32, 64, 128, 256, 512, 1024 };
     private const int MAX_CHANNELS = 128;
 
     private Backend backend;
@@ -25,6 +26,7 @@ public class InfernoDvs.MainWindow : Gtk.ApplicationWindow {
     private Gtk.SpinButton tx_spin;
     private Gtk.DropDown rate_drop;
     private Gtk.DropDown latency_drop;
+    private Gtk.DropDown quantum_drop;
     private Gtk.Switch autostart_switch;
     private Gtk.Switch default_out_switch;
     private Gtk.Switch default_in_switch;
@@ -99,6 +101,12 @@ public class InfernoDvs.MainWindow : Gtk.ApplicationWindow {
         }
         latency_drop = new Gtk.DropDown.from_strings (lat_labels);
 
+        string[] q_labels = {};
+        foreach (var q in QUANTA) {
+            q_labels += "%d samples".printf (q);
+        }
+        quantum_drop = new Gtk.DropDown.from_strings (q_labels);
+
         autostart_switch = new Gtk.Switch () { halign = Gtk.Align.START, valign = Gtk.Align.CENTER };
 
         var grid = new Gtk.Grid () { column_spacing = 12, row_spacing = 6 };
@@ -108,7 +116,10 @@ public class InfernoDvs.MainWindow : Gtk.ApplicationWindow {
         add_row (grid, ref row, "Receive channels", rx_spin, "Dante → this computer (PipeWire source)");
         add_row (grid, ref row, "Transmit channels", tx_spin, "This computer → Dante (PipeWire sink)");
         add_row (grid, ref row, "Sample rate", rate_drop);
-        add_row (grid, ref row, "Latency", latency_drop);
+        add_row (grid, ref row, "Latency", latency_drop,
+                 "Dante network latency. Receivers use at least this; this device receives with at least this");
+        add_row (grid, ref row, "PipeWire buffer", quantum_drop,
+                 "Local audio buffer (quantum) at the Dante sample rate; smaller is lower latency, more CPU");
         add_row (grid, ref row, "Start automatically", autostart_switch);
 
         default_out_switch = new Gtk.Switch () { halign = Gtk.Align.START, valign = Gtk.Align.CENTER };
@@ -159,6 +170,7 @@ public class InfernoDvs.MainWindow : Gtk.ApplicationWindow {
         tx_spin.value_changed.connect (mark_dirty);
         rate_drop.notify["selected"].connect (mark_dirty);
         latency_drop.notify["selected"].connect (mark_dirty);
+        quantum_drop.notify["selected"].connect (mark_dirty);
         apply_button.clicked.connect (() => apply.begin ());
         clock_button.clicked.connect (() => enable_clock.begin ());
         power_switch.state_set.connect ((on) => {
@@ -243,6 +255,7 @@ public class InfernoDvs.MainWindow : Gtk.ApplicationWindow {
             tx_spin.value = s.tx_channels;
             rate_drop.selected = index_of_rate (s.sample_rate);
             latency_drop.selected = index_of_latency (s.latency_ms);
+            quantum_drop.selected = index_of_quantum (s.pw_quantum);
             autostart_switch.active = s.autostart;
             dirty = false;
             apply_button.sensitive = false;
@@ -308,13 +321,22 @@ public class InfernoDvs.MainWindow : Gtk.ApplicationWindow {
         return 1;
     }
 
+    private uint index_of_quantum (int q) {
+        for (int i = 0; i < QUANTA.length; i++) {
+            if (QUANTA[i] == q) {
+                return i;
+            }
+        }
+        return 3;
+    }
+
     private uint index_of_latency (double ms) {
         for (int i = 0; i < LATENCIES.length; i++) {
             if ((LATENCIES[i] - ms).abs () < 0.001) {
                 return i;
             }
         }
-        return 2;
+        return 5; // 4 ms
     }
 
     private string selected_iface () {
@@ -341,7 +363,8 @@ public class InfernoDvs.MainWindow : Gtk.ApplicationWindow {
                 "rx_channels=%d".printf ((int) rx_spin.value),
                 "tx_channels=%d".printf ((int) tx_spin.value),
                 "sample_rate=%d".printf (RATES[rate_drop.selected]),
-                "latency_ms=%g".printf (LATENCIES[latency_drop.selected])
+                "latency_ms=%g".printf (LATENCIES[latency_drop.selected]),
+                "pw_quantum=%d".printf (QUANTA[quantum_drop.selected])
             });
             dirty = false;
 

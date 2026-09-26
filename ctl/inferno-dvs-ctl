@@ -63,9 +63,17 @@ DEFAULTS = {
     "tx_channels": "8",
     "sample_rate": "48000",
     "latency_ms": "4",
+    # How far in the past packets are stamped relative to when they are sent.
+    # Inferno's default is -500 us; with realtime send threads far less is
+    # needed, and every microsecond here is latency receivers must absorb.
+    "tx_ts_offset_us": "-100",
+    # PipeWire buffer (quantum) the Inferno nodes ask for, in samples at the
+    # Dante sample rate. This is local latency on top of the Dante latency.
+    "pw_quantum": "256",
     "autostart": "false",
 }
 SAMPLE_RATES = (44100, 48000, 88200, 96000)
+PW_QUANTA = (32, 64, 128, 256, 512, 1024)
 MAX_CHANNELS = 128
 
 SKIP_IF_PREFIX = ("lo", "docker", "veth", "br-", "virbr", "tun", "tap", "wg")
@@ -116,6 +124,12 @@ def validated(cfg):
     out["latency_ms"] = float(out["latency_ms"])
     if not 0.25 <= out["latency_ms"] <= 40:
         raise ValueError("latency_ms must be 0.25..40")
+    out["pw_quantum"] = int(out["pw_quantum"])
+    if out["pw_quantum"] not in PW_QUANTA:
+        raise ValueError(f"pw_quantum must be one of {PW_QUANTA}")
+    out["tx_ts_offset_us"] = int(float(out["tx_ts_offset_us"]))
+    if not -1000 <= out["tx_ts_offset_us"] <= 0:
+        raise ValueError("tx_ts_offset_us must be -1000..0")
     name = "".join(c for c in out["name"] if c.isalnum() or c == "-")[:31]
     out["name"] = name or default_name()
     return out
@@ -199,6 +213,7 @@ pcm.{PCM_NAME} {{
 	TX_CHANNELS "{cfg['tx_channels']}"
 	RX_LATENCY_NS "{lat_ns}"
 	TX_LATENCY_NS "{lat_ns}"
+	TX_TS_OFFSET_NS "{cfg['tx_ts_offset_us'] * 1000}"
 	CLOCK_PATH "{USRVCLOCK_SOCK}"
 	hint {{
 		show on
@@ -259,9 +274,12 @@ def pw_up():
     cfg = validated(load_config())
     write_alsa_conf(cfg)
     pw_down()
+    q, rate = cfg["pw_quantum"], cfg["sample_rate"]
+    allow_graph_rate(rate)
     common = (f'object.linger=true api.alsa.path="{PCM_NAME}" '
-              f'api.alsa.pcm.card=999 api.alsa.headroom=128 '
-              f'audio.rate={cfg["sample_rate"]} '
+              f'api.alsa.pcm.card=999 api.alsa.headroom={min(q, 64)} '
+              f'api.alsa.period-size={q} node.latency={q}/{rate} '
+              f'audio.rate={rate} node.rate=1/{rate} '
               'session.suspend-timeout-seconds=0 node.pause-on-idle=false '
               'node.suspend-on-idle=false node.always-process=true')
     label = cfg["name"]
@@ -330,6 +348,24 @@ def set_default(kind, on):
     else:
         # wpctl clear-default index: 0 = audio sink, 1 = audio source
         run("wpctl", "clear-default", "0" if kind == "output" else "1")
+
+
+def allow_graph_rate(rate):
+    """Let the PipeWire graph run at the Dante rate instead of resampling.
+
+    Runtime-only (pw-metadata); PipeWire's configured default rate is kept.
+    """
+    r = run("pw-metadata", "-n", "settings", "0")
+    allowed = []
+    for line in r.stdout.splitlines():
+        if "'clock.allowed-rates'" in line:
+            v = line.split("value:'", 1)[1].split("'", 1)[0]
+            allowed = [int(x) for x in v.strip("[] ").replace(",", " ").split() if x.isdigit()]
+    if rate in allowed:
+        return
+    rates = sorted(set(allowed or [48000]) | {rate})
+    run("pw-metadata", "-n", "settings", "0", "clock.allowed-rates",
+        "[ " + " ".join(map(str, rates)) + " ]")
 
 
 def pw_down():

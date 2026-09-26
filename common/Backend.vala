@@ -41,6 +41,7 @@ namespace InfernoDvs {
         public int tx_channels;
         public int sample_rate;
         public double latency_ms;
+        public int pw_quantum;
 
         public bool clock_running () {
             return statime != "" && statime != "inactive";
@@ -152,6 +153,7 @@ namespace InfernoDvs {
             s.tx_channels = int.parse (get_str (kf, "config", "tx_channels"));
             s.sample_rate = int.parse (get_str (kf, "config", "sample_rate"));
             s.latency_ms = double.parse (get_str (kf, "config", "latency_ms"));
+            s.pw_quantum = int.parse (get_str (kf, "config", "pw_quantum"));
             return s;
         }
 

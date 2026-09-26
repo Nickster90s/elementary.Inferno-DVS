@@ -1,0 +1,286 @@
+diff --git a/inferno_aoip/Cargo.toml b/inferno_aoip/Cargo.toml
+index 0799b15..96d0fa8 100644
+--- a/inferno_aoip/Cargo.toml
++++ b/inferno_aoip/Cargo.toml
+@@ -17,6 +17,7 @@ hex = "0.4"
+ binary-layout = "3.3"
+ futures = "0.3"
+ itertools = "0.12"
++libc = "0.2"
+ log = "0.4"
+ atomic_enum = "0.2"
+ local-ip-address = "0.5"
+diff --git a/inferno_aoip/src/device_server/flows_rx.rs b/inferno_aoip/src/device_server/flows_rx.rs
+index 3f035ec..5d63c60 100644
+--- a/inferno_aoip/src/device_server/flows_rx.rs
++++ b/inferno_aoip/src/device_server/flows_rx.rs
+@@ -49,6 +49,7 @@ struct SocketData<P: ProxyToSamplesBuffer> {
+   channels: Vec<Option<Channel<P>>>,
+   empty_sinks_vecs: Vec<Vec<RBInput<Sample, P>>>,
+   actual_latency_samples: Arc<AtomicI32>,
++  lag_stats: super::flows_tx::LagStats,
+ }
+ 
+ struct SilenceWriter<P: ProxyToSamplesBuffer> {
+@@ -122,6 +123,15 @@ impl<P: ProxyToSamplesBuffer> FlowsReceiverInternal<P> {
+             let latency = wrapped_diff(now, timestamp).clamp(0, i32::MAX as _);
+             sd.actual_latency_samples.fetch_max(latency as _, Ordering::Relaxed);
+           }
++          if let Some(now_ns) = clock.now_ns() {
++            let secs = u32::from_be_bytes([buf[1], buf[2], buf[3], buf[4]]) as i64;
++            let sub = u32::from_be_bytes([buf[5], buf[6], buf[7], buf[8]]) as i64;
++            let ts_ns = secs * 1_000_000_000 + sub * 1_000_000_000 / sample_rate as i64;
++            // now_ns is the full PTP time; the packet carries seconds mod 2^32
++            let now_ns = now_ns as i64 % (1i64 << 32).saturating_mul(1_000_000_000);
++            sd.lag_stats.record(now_ns - ts_ns);
++            sd.lag_stats.maybe_report_as("rx arrival lag", &format!("from {src}"));
++          }
+ 
+           if write {
+             let num_channels = sd.channels.len();
+@@ -568,6 +578,7 @@ impl<P: ProxyToSamplesBuffer + Send + Sync + 'static> FlowsReceiver<P> {
+           channels: (0..channels_count).map(|_| None).collect(),
+           empty_sinks_vecs,
+           actual_latency_samples: als,
++          lag_stats: super::flows_tx::LagStats::new(),
+         },
+       })
+       .await
+diff --git a/inferno_aoip/src/device_server/flows_tx.rs b/inferno_aoip/src/device_server/flows_tx.rs
+index 9d8cec3..a6bfed3 100644
+--- a/inferno_aoip/src/device_server/flows_tx.rs
++++ b/inferno_aoip/src/device_server/flows_tx.rs
+@@ -42,7 +42,63 @@ pub const PROCESS_EVENTS_INTERVAL: Duration = Duration::from_millis(33);
+ pub const MIN_SLEEP: Duration = Duration::from_millis(0); // to save CPU cycles, TODO: make it configurable via some "eco mode" flag
+ 
+ // it's better to have the clock in the past than in the future - otherwise Dante devices receiving from us go mad and fart
+-const CLOCK_OFFSET_NS: ClockDiff = -500_000;
++// Packets are stamped this much earlier than the media clock time at which they are sent. Every
++// nanosecond here is latency every receiver has to absorb, so keep it small once the send thread is
++// realtime; set with TX_TS_OFFSET_NS (ALSA plugin parameter or INFERNO_TX_TS_OFFSET_NS).
++static TX_TS_OFFSET_NS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(-500_000);
++
++pub fn set_tx_ts_offset_ns(ns: i64) {
++  TX_TS_OFFSET_NS.store(ns.min(0), Ordering::Relaxed);
++}
++
++/// Lag statistics on the media clock: for TX how late each packet actually left,
++/// for RX how late (relative to its timestamp) each packet arrived.
++pub(super) struct LagStats {
++  buckets: [u64; 7], // <25, <50, <100, <200, <500, <1000, >=1000 us
++  max_ns: i64,
++  sum_ns: i64,
++  count: u64,
++  next_report: std::time::Instant,
++}
++
++impl LagStats {
++  const EDGES_US: [i64; 6] = [25, 50, 100, 200, 500, 1000];
++  pub(super) fn new() -> Self {
++    Self {
++      buckets: [0; 7],
++      max_ns: 0,
++      sum_ns: 0,
++      count: 0,
++      next_report: std::time::Instant::now() + Duration::from_secs(10),
++    }
++  }
++  #[inline(always)]
++  pub(super) fn record(&mut self, lag_ns: i64) {
++    let us = lag_ns / 1000;
++    let i = Self::EDGES_US.iter().position(|&e| us < e).unwrap_or(6);
++    self.buckets[i] += 1;
++    self.max_ns = self.max_ns.max(lag_ns);
++    self.sum_ns += lag_ns;
++    self.count += 1;
++  }
++  fn maybe_report(&mut self, offset_ns: i64) {
++    self.maybe_report_as("tx send lag", &format!("ts offset {} us", offset_ns / 1000));
++  }
++  pub(super) fn maybe_report_as(&mut self, what: &str, extra: &str) {
++    if self.count == 0 || std::time::Instant::now() < self.next_report {
++      return;
++    }
++    let b = &self.buckets;
++    info!(
++      "{what} over {} packets: avg {} us, max {} us | <25us {} <50 {} <100 {} <200 {} <500 {} <1000 {} >=1ms {} | {extra}",
++      self.count,
++      self.sum_ns / self.count as i64 / 1000,
++      self.max_ns / 1000,
++      b[0], b[1], b[2], b[3], b[4], b[5], b[6],
++    );
++    *self = Self::new();
++  }
++}
+ 
+ pub type SamplesRequestCallback = Box<dyn FnMut(Clock, usize, &mut [Sample]) + Send + 'static>;
+ 
+@@ -104,6 +160,7 @@ struct FlowsTransmitterInternal<P: ProxyToSamplesBuffer> {
+   tx_source_bit_depth: u8,
+   current_timestamp: Arc<AtomicUsize>,
+   on_transfer: Option<TransferNotifier>,
++  lag_stats: LagStats,
+   //callback: SamplesRequestCallback,
+ }
+ 
+@@ -144,6 +201,12 @@ impl<P: ProxyToSamplesBuffer> FlowsTransmitterInternal<P> {
+         flow.bootstrap_next_ts(now);
+       }
+       pbuff[9..9 + stride * flow.fpp].fill(0);
++      if lag >= 0 {
++        if let Some(now_ns) = self.clock.now_ns() {
++          let due_ns = ((flow.next_ts as u128) * 1_000_000_000u128 / sample_rate as u128) as i64;
++          self.lag_stats.record((now_ns as i64).wrapping_sub(due_ns));
++        }
++      }
+       while wrapped_diff(now as Clock, flow.next_ts as Clock) >= 0 {
+         pbuff[0] = 2u8; // ???
+         let packet_ts = flow.next_ts.wrapping_add_signed(self.clock_offset_samples) /* .wrapping_sub(flow.fpp) */; // ???
+@@ -374,6 +437,7 @@ impl<P: ProxyToSamplesBuffer> FlowsTransmitterInternal<P> {
+         }
+       }
+ 
++      self.lag_stats.maybe_report(self.clock_offset_samples * 1_000_000_000 / self.sample_rate as i64);
+       match command {
+         Command::Shutdown => {
+           break;
+@@ -488,11 +552,13 @@ impl FlowsTransmitter {
+       max_lag_samples,
+       timestamp_shift: (0 as ClockDiff).wrapping_sub_unsigned(latency.try_into().unwrap()),
+       tx_source_bit_depth,
+-      clock_offset_samples: (CLOCK_OFFSET_NS as i64 * sample_rate as i64 / 1_000_000_000i64)
++      clock_offset_samples: (TX_TS_OFFSET_NS.load(Ordering::Relaxed) * sample_rate as i64
++        / 1_000_000_000i64)
+         .try_into()
+         .unwrap(),
+       current_timestamp,
+       on_transfer,
++      lag_stats: LagStats::new(),
+     };
+     internal.run(start_time_rx).await;
+   }
+diff --git a/inferno_aoip/src/device_server/settings.rs b/inferno_aoip/src/device_server/settings.rs
+index 359fa90..276678d 100644
+--- a/inferno_aoip/src/device_server/settings.rs
++++ b/inferno_aoip/src/device_server/settings.rs
+@@ -184,6 +184,9 @@ impl Settings {
+       .get("USE_SAFE_CLOCK")
+       .map(|s| s.parse().expect("invalid USE_SAFE_CLOCK, must be boolean"))
+       .unwrap_or(false);
++    if let Some(v) = config.get("TX_TS_OFFSET_NS") {
++      super::flows_tx::set_tx_ts_offset_ns(v.parse().expect("invalid TX_TS_OFFSET_NS, must be integer"));
++    }
+     let tx_source_bit_depth = config
+       .get("TX_SOURCE_BIT_DEPTH")
+       .map(|s| s.parse::<u8>().expect("invalid TX_SOURCE_BIT_DEPTH, must be one of: 16, 24, 32"))
+diff --git a/inferno_aoip/src/util/os.rs b/inferno_aoip/src/util/os.rs
+index e0343fc..9a99fbc 100644
+--- a/inferno_aoip/src/util/os.rs
++++ b/inferno_aoip/src/util/os.rs
+@@ -1,5 +1,11 @@
+ use thread_priority::{thread_native_id, Error};
+ 
++/// Make the current thread realtime (SCHED_FIFO/RR).
++///
++/// Tries `sched_setscheduler` first. That fails for ordinary desktop users
++/// (RLIMIT_RTPRIO is 0), which is how PipeWire runs, so it then asks
++/// RealtimeKit over D-Bus, the same way PipeWire's own module-rt gets its
++/// data thread realtime. The priority is clamped to rtkit's maximum.
+ #[cfg(target_family = "unix")]
+ pub fn set_current_thread_realtime(priority_hint: u8) -> Result<(), Error> {
+   use thread_priority::unix::set_thread_priority_and_policy;
+@@ -7,11 +13,92 @@ pub fn set_current_thread_realtime(priority_hint: u8) -> Result<(), Error> {
+     RealtimeThreadSchedulePolicy, ThreadPriority, ThreadPriorityValue, ThreadSchedulePolicy,
+   };
+ 
+-  set_thread_priority_and_policy(
++  let direct = set_thread_priority_and_policy(
+     thread_native_id(),
+     ThreadPriority::Crossplatform(ThreadPriorityValue::try_from(priority_hint).unwrap()),
+     ThreadSchedulePolicy::Realtime(RealtimeThreadSchedulePolicy::Fifo),
+-  )
++  );
++  if direct.is_ok() {
++    log::info!("thread {} realtime (priority {priority_hint}, direct)", thread_name());
++    return direct;
++  }
++  #[cfg(target_os = "linux")]
++  {
++    set_timer_slack_min();
++    match rtkit::make_current_thread_realtime(priority_hint as u32) {
++      Ok(prio) => {
++        log::info!("thread {} realtime (priority {prio}, via rtkit)", thread_name());
++        return Ok(());
++      }
++      Err(e) => {
++        log::warn!(
++          "thread {} could not be made realtime ({direct:?}; rtkit: {e}); expect timing jitter",
++          thread_name()
++        );
++      }
++    }
++  }
++  direct
++}
++
++fn thread_name() -> String {
++  std::thread::current().name().unwrap_or("?").to_owned()
++}
++
++/// Non-realtime threads get 50 us of timer slack by default; use the minimum
++/// so sleeps end on time even if realtime scheduling is unavailable.
++#[cfg(target_os = "linux")]
++fn set_timer_slack_min() {
++  unsafe {
++    libc::prctl(libc::PR_SET_TIMERSLACK, 1 as libc::c_ulong, 0, 0, 0);
++  }
++}
++
++#[cfg(target_os = "linux")]
++mod rtkit {
++  use std::process::Command;
++
++  const DEST: &str = "org.freedesktop.RealtimeKit1";
++  const PATH: &str = "/org/freedesktop/RealtimeKit1";
++
++  fn busctl(args: &[&str]) -> Result<String, String> {
++    let out = Command::new("busctl")
++      .arg("--system")
++      .args(args)
++      .output()
++      .map_err(|e| format!("busctl: {e}"))?;
++    if out.status.success() {
++      Ok(String::from_utf8_lossy(&out.stdout).trim().to_owned())
++    } else {
++      Err(String::from_utf8_lossy(&out.stderr).trim().to_owned())
++    }
++  }
++
++  /// rtkit refuses processes without an RLIMIT_RTTIME. PipeWire sets one
++  /// (200 ms); set the same for other hosts (aplay, JACK clients, ...).
++  fn ensure_rttime_limit() {
++    unsafe {
++      let mut lim = std::mem::zeroed::<libc::rlimit>();
++      if libc::getrlimit(libc::RLIMIT_RTTIME, &mut lim) == 0 && lim.rlim_max == libc::RLIM_INFINITY {
++        let l = libc::rlimit { rlim_cur: 200_000, rlim_max: 200_000 };
++        libc::setrlimit(libc::RLIMIT_RTTIME, &l);
++      }
++    }
++  }
++
++  pub fn make_current_thread_realtime(hint: u32) -> Result<u32, String> {
++    ensure_rttime_limit();
++    let max = busctl(&["get-property", DEST, PATH, DEST, "MaxRealtimePriority"])
++      .ok()
++      .and_then(|s| s.split_whitespace().nth(1).and_then(|v| v.parse::<u32>().ok()))
++      .unwrap_or(20);
++    let prio = hint.min(max).max(1);
++    let pid = std::process::id().to_string();
++    let tid = unsafe { libc::gettid() }.to_string();
++    let prio_s = prio.to_string();
++    busctl(&["call", DEST, PATH, DEST, "MakeThreadRealtimeWithPID", "ttu", &pid, &tid, &prio_s])?;
++    Ok(prio)
++  }
+ }
+ 
+ #[cfg(not(target_family = "unix"))]

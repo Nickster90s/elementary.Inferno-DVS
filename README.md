@@ -22,7 +22,7 @@ Under the hood it is built on:
 
 | | |
 |---|---|
-| **Settings app** (*Inferno DVS*) | Device name, network interface, receive and transmit channel counts (0–128), sample rate (44.1/48/88.2/96 kHz), latency (1–40 ms), start automatically, on/off switch, live clock status, and "use as system output/input" switches |
+| **Settings app** (*Inferno DVS*) | Device name, network interface, receive and transmit channel counts (0–128), sample rate (44.1/48/88.2/96 kHz), latency (0.25–40 ms), PipeWire buffer, start automatically, on/off switch, live clock status, and "use as system output/input" switches |
 | **Wingpanel indicator** | On/off switch, name, channels, IP, clock state, System Output / System Input switches, and a link to the settings app |
 | **PipeWire devices** | `<name> (Dante out, N ch)` is a sink, so audio played to it goes to the network. `<name> (Dante in, N ch)` is a source that brings audio in from the network |
 | **`inferno-dvs-ctl`** | Command-line control, also used by the app and the indicator |
@@ -36,6 +36,43 @@ software timestamps), with a Focusrite RedNet AM2 as the PTP leader:
 - Audio from this PC played on a RedNet AM2 and on an ESP32-P4 based
   8-channel receiver, at 48 and 96 kHz.
 - PTP stayed locked, with the offset from the leader within about ±300 ns.
+
+## Latency
+
+The upstream Inferno defaults are tuned for safety. This project changes three
+things (patch `0002`, plus the helper):
+
+| | Upstream Inferno | Inferno DVS |
+|---|---|---|
+| Send/receive threads | asks for SCHED_FIFO, which fails silently for desktop users, so they run at normal priority | realtime via **RealtimeKit** (RR 20, like PipeWire's own data thread) |
+| Packet timestamp offset | fixed −500 µs | **−93 µs**, set with `tx_ts_offset_us` |
+| PipeWire buffer | graph default (1024 samples at 48 kHz, resampled) | **256 samples at the Dante rate**, 32–1024 selectable |
+
+Measured on 2026-09-26 at 96 kHz. The receiver was an ESP32-P4 Dante-compatible
+DAC that timestamps packet arrival against a hardware PTP clock:
+
+| Receiver latency | Late packets, upstream | Late packets, Inferno DVS |
+|---|---|---|
+| 2 ms | 0.001 % | 0 % |
+| 1.5 ms | 0.5 % | 0.03 % |
+| 1 ms | 62 % | 0.03–0.2 % |
+| 0.75 ms (that DAC's minimum) | 96 % | 0.3 % |
+
+Inferno's own send timing is 10–20 µs on average and under 200 µs at worst.
+On the same network, packets from **Dante Virtual Soundcard** (Mac) arrived
+540 µs late on average and up to 3.6 ms late, which is why DVS needs 4 ms. The
+remaining late packets at 1 ms and below come from after the packet leaves the
+PC (network and receiver), not from Inferno.
+
+Notes:
+
+- Receive latency only has to cover how late the *sender* is: 1 ms or less
+  from Inferno or hardware devices, and about 4 ms from DVS.
+- Inferno logs its lag statistics every 10 s:
+  `journalctl --user -u pipewire | grep lag`.
+- Turn off Energy-Efficient Ethernet on switches and on the NIC
+  (`sudo ethtool --set-eee eno1 eee off`). Audinate recommends this for
+  Dante; on this bench it made no measurable difference.
 
 ## How it works
 
@@ -135,7 +172,8 @@ switches, or pick the device inside your app. Apps with their own device list
 ```text
 inferno-dvs-ctl status                      # state and config (keyfile format)
 inferno-dvs-ctl start | stop | restart      # PipeWire nodes on/off
-inferno-dvs-ctl set rx_channels=16 tx_channels=16 sample_rate=48000 latency_ms=10
+inferno-dvs-ctl set rx_channels=16 tx_channels=16 sample_rate=48000 latency_ms=1
+inferno-dvs-ctl set pw_quantum=128 tx_ts_offset_us=-100
 inferno-dvs-ctl clock-on | clock-off        # PTP daemon for the configured NIC
 inferno-dvs-ctl default output on|off       # use as system sink
 inferno-dvs-ctl default input on|off        # use as system source
@@ -148,8 +186,9 @@ inferno-dvs-ctl interfaces                  # NICs it can use
 - **Patch stays orange, or fails with "sample rate mismatch"**: the Linux
   device and the other device must run at the same sample rate. Check both in
   Dante Controller.
-- **Occasional clicks**: raise the latency. 4 ms works but can let a few late
-  packets through on a normal desktop kernel; 6–10 ms is safer. Inferno's
+- **Occasional clicks**: raise the latency or the PipeWire buffer. Check
+  `journalctl --user -u pipewire | grep lag` for how late packets arrive.
+  From DVS you need about 4 ms. Inferno's
   README has tuning tips (`cyclictest`, `isolcpus`, PREEMPT_RT).
 - **A receiver shows the patch green but plays nothing**: power-cycle the
   receiver. We saw a RedNet AM2 get stuck after its source device had
@@ -163,6 +202,12 @@ inferno-dvs-ctl interfaces                  # NICs it can use
   Inferno restarts its threads.
 
 ## Patches to Inferno
+
+`patches/0002-realtime-threads-and-tx-timestamp-offset.patch` makes Inferno's
+send and receive threads realtime through RealtimeKit when direct
+SCHED_FIFO is not allowed. It also makes the packet timestamp offset
+configurable (`TX_TS_OFFSET_NS`) and logs send/arrival lag statistics. See
+[Latency](#latency).
 
 `patches/0001-mdns-srv-target-device-hostname.patch` fixes Inferno's mDNS
 (searchfire). Each channel's SRV record pointed at `<channel>@<device>.local`
