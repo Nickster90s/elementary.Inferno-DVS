@@ -8,6 +8,7 @@ standard library only.
   status                  current state             (keyfile on stdout)
   start | stop | restart  bring the soundcard (PipeWire nodes) up / down
   setup                   one-time per-user setup (units, PipeWire override)
+  apply-requests          apply latency/rate changes made in Dante Controller
   clock-on | clock-off    enable/disable the PTP daemon (asks admin password)
   pw-up | pw-down         used by inferno-dvs.service (user unit)
   set KEY=VALUE...        change config.ini
@@ -215,6 +216,7 @@ pcm.{PCM_NAME} {{
 	TX_LATENCY_NS "{lat_ns}"
 	TX_TS_OFFSET_NS "{cfg['tx_ts_offset_us'] * 1000}"
 	CLOCK_PATH "{USRVCLOCK_SOCK}"
+	PTP_OBSERVATION_PATH "{OBSERVE_SOCK}"
 	hint {{
 		show on
 		description "Inferno DVS"
@@ -495,6 +497,39 @@ def ptp_status():
 
 # ---------------------------------------------------------------- commands
 
+def cmd_apply_requests():
+    """Apply what Dante Controller asked Inferno for (latency, sample rate).
+
+    Inferno answers the controller at once but cannot change these while it
+    runs, so it leaves controller_request.toml in its state directory; the
+    inferno-dvs-requests.path unit runs this when the file appears.
+    """
+    import tomllib
+    state = Path(os.environ.get("XDG_STATE_HOME", HOME / ".local" / "state")) / "inferno_aoip"
+    changed = False
+    cfg = load_config()
+    for f in state.glob("*/controller_request.toml"):
+        try:
+            req = tomllib.loads(f.read_text())
+        except (OSError, tomllib.TOMLDecodeError):
+            req = {}
+        f.unlink(missing_ok=True)
+        if "latency_ns" in req:
+            ms = int(req["latency_ns"]) / 1_000_000
+            if abs(float(cfg["latency_ms"]) - ms) > 1e-6:
+                cfg["latency_ms"] = f"{ms:g}"
+                changed = True
+        if "sample_rate" in req and int(req["sample_rate"]) != int(cfg["sample_rate"]):
+            cfg["sample_rate"] = str(int(req["sample_rate"]))
+            changed = True
+    if changed:
+        save_config(validated(cfg))
+        print(f"applying controller request: latency {cfg['latency_ms']} ms, "
+              f"rate {cfg['sample_rate']} Hz")
+        if systemctl("is-active", USER_UNIT, user=True).stdout.strip() == "active":
+            systemctl("restart", USER_UNIT, user=True)
+
+
 def cmd_interfaces():
     for i in list_interfaces():
         emit(i["name"], {"mac": i["mac"], "state": i["state"],
@@ -581,6 +616,9 @@ def cmd_setup():
     CONF_DIR.mkdir(parents=True, exist_ok=True)
     if not CONF_FILE.exists():
         save_config(load_config())
+    # Apply latency / sample-rate changes made in Dante Controller.
+    systemctl("daemon-reload", user=True)
+    systemctl("enable", "--now", "inferno-dvs-requests.path", user=True)
 
 
 def save_config(cfg):
@@ -630,6 +668,8 @@ def main(argv):
             set_default(args[0], args[1] == "on")
         elif cmd == "setup":
             cmd_setup()
+        elif cmd == "apply-requests":
+            cmd_apply_requests()
         elif cmd == "clock-on":
             clock_on()
         elif cmd == "clock-off":

@@ -1,0 +1,9 @@
+[Unit]
+Description=Watch for Dante Controller latency / sample-rate changes to Inferno DVS
+
+[Path]
+PathExistsGlob=%h/.local/state/inferno_aoip/*/controller_request.toml
+Unit=inferno-dvs-requests.service
+
+[Install]
+WantedBy=default.target

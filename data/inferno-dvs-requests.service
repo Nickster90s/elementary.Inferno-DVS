@@ -1,0 +1,6 @@
+[Unit]
+Description=Apply Dante Controller latency / sample-rate changes to Inferno DVS
+
+[Service]
+Type=oneshot
+ExecStart=@BINDIR@/inferno-dvs-ctl apply-requests

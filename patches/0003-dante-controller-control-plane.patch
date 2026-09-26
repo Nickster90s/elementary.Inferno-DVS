@@ -1,0 +1,720 @@
+diff --git a/inferno_aoip/src/device_server/arc_server.rs b/inferno_aoip/src/device_server/arc_server.rs
+index 7ff814b..d580acc 100644
+--- a/inferno_aoip/src/device_server/arc_server.rs
++++ b/inferno_aoip/src/device_server/arc_server.rs
+@@ -30,6 +30,100 @@ use tokio::sync::broadcast::Receiver as BroadcastReceiver;
+ use tokio::sync::mpsc::Sender;
+ use tokio::sync::{watch, Mutex};
+ 
++// ---------------------------------------------------------------------------
++// Device property tables (0x1100 / 0x1102), as a RedNet AM2 answers them. With
++// all-zero tables Dante Controller classifies the device as PTPv2 domain 0 and
++// cannot show or change its latency. Ported from the ESP32/FPGA AoIP projects,
++// where they were verified against Dante Controller.
++//
++// 0x1102: u16 count, then count x (u16 key, u16 type).
++// 0x1100: u16 (flags<<8 | count), then count x (u16 key, u16 value); keys with
++//         bit 15 set hold an OFFSET (absolute, including the 10-byte header)
++//         into the data blob after the table:
++//   0x8205 / 0x8301  configured latency, ns
++//   0x8306           minimum supported latency, ns (what DC offers down to)
++//   0x8020           current sample rate
++// ---------------------------------------------------------------------------
++const ARC_1100_TEMPLATE: [u8; 202] = [
++  0x24, 0x1f, 0x80, 0x20, 0x00, 0x9c, 0x80, 0x21, 0x00, 0xa0, 0x00, 0x22, 0x00, 0x01, 0x00, 0x23,
++  0x00, 0x18, 0x00, 0x24, 0x00, 0x01, 0x80, 0x60, 0x00, 0xb0, 0x00, 0x62, 0x00, 0x01, 0x00, 0x63,
++  0x00, 0x01, 0x02, 0x01, 0x00, 0x01, 0x82, 0x04, 0x00, 0xb4, 0x82, 0x05, 0x00, 0xb8, 0x02, 0x0a,
++  0x00, 0x00, 0x02, 0x0b, 0x00, 0x00, 0x02, 0x10, 0x00, 0x00, 0x02, 0x11, 0x00, 0x00, 0x02, 0x12,
++  0x00, 0x30, 0x02, 0x13, 0x00, 0x00, 0x02, 0x14, 0x00, 0x00, 0x02, 0x22, 0x13, 0x8c, 0x83, 0x01,
++  0x00, 0xbc, 0x83, 0x06, 0x00, 0xc0, 0x83, 0x02, 0x00, 0xc4, 0x83, 0x21, 0x00, 0xc8, 0x03, 0x10,
++  0x00, 0x10, 0x03, 0x11, 0x00, 0x10, 0x03, 0x12, 0x00, 0x30, 0x03, 0x03, 0x00, 0x02, 0x83, 0xf0,
++  0x00, 0xcc, 0x06, 0x01, 0x00, 0x00, 0x03, 0x09, 0x00, 0x03, 0x02, 0x09, 0x00, 0x01, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0xbb, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xef, 0x45, 0x00, 0x00, 0x00, 0x0f, 0x42, 0x40, 0x00, 0x07,
++  0xa1, 0x20, 0x00, 0x07, 0xa1, 0x20, 0x00, 0x03, 0xd0, 0x90, 0x01, 0x35, 0xf1, 0xb4, 0x00, 0x1e,
++  0x84, 0x80, 0x00, 0x00, 0x00, 0x05, 0x00, 0x00, 0x00, 0x00,
++];
++const ARC_1102_TABLE: [u8; 126] = [
++  0x00, 0x1f, 0x80, 0x20, 0x00, 0x01, 0x80, 0x21, 0x00, 0x03, 0x00, 0x22, 0x00, 0x03, 0x00, 0x23,
++  0x00, 0x03, 0x00, 0x24, 0x00, 0x01, 0x80, 0x60, 0x00, 0x03, 0x00, 0x62, 0x00, 0x03, 0x00, 0x63,
++  0x00, 0x01, 0x02, 0x01, 0x00, 0x03, 0x82, 0x04, 0x00, 0x03, 0x82, 0x05, 0x00, 0x03, 0x02, 0x0a,
++  0x00, 0x01, 0x02, 0x0b, 0x00, 0x01, 0x02, 0x10, 0x00, 0x03, 0x02, 0x11, 0x00, 0x03, 0x02, 0x12,
++  0x00, 0x03, 0x02, 0x13, 0x00, 0x01, 0x02, 0x14, 0x00, 0x01, 0x02, 0x22, 0x00, 0x03, 0x83, 0x01,
++  0x00, 0x03, 0x83, 0x06, 0x00, 0x01, 0x83, 0x02, 0x00, 0x01, 0x83, 0x21, 0x00, 0x01, 0x03, 0x10,
++  0x00, 0x01, 0x03, 0x11, 0x00, 0x01, 0x03, 0x12, 0x00, 0x01, 0x03, 0x03, 0x00, 0x03, 0x83, 0xf0,
++  0x00, 0x01, 0x06, 0x01, 0x00, 0x01, 0x03, 0x09, 0x00, 0x01, 0x02, 0x09, 0x00, 0x01,
++];
++/// Lowest latency Dante Controller offers for this device.
++const MIN_LATENCY_NS: u32 = 250_000;
++/// What real devices return for an opcode they do not support.
++const CODE_UNSUPPORTED: u16 = 0x22;
++
++/// Write a u32 into the 0x1100 data blob, at the offset an offset-key holds.
++fn arc_1100_patch_u32(table: &mut [u8], key: u16, value: u32) {
++  let count = table[1] as usize;
++  for i in 0..count {
++    let at = 2 + i * 4;
++    if make_u16(table[at], table[at + 1]) != key {
++      continue;
++    }
++    let off = make_u16(table[at + 2], table[at + 3]) as usize;
++    if off < HEADER_LENGTH || off - HEADER_LENGTH + 4 > table.len() {
++      return;
++    }
++    let bi = off - HEADER_LENGTH;
++    table[bi..bi + 4].copy_from_slice(&value.to_be_bytes());
++    return;
++  }
++}
++
++/// Dotted version string ("4.0.2", "2.7.41") to the u16 real devices put in
++/// their 0x1003 reply: high byte = major<<4 | minor for arcp-style, or
++/// major/minor bytes for router-style.
++fn version_word(v: &str, nibbles: bool) -> u16 {
++  let p: Vec<u16> = v.split('.').map(|x| x.parse().unwrap_or(0)).collect();
++  let (a, b, c) = (p.first().copied().unwrap_or(0), p.get(1).copied().unwrap_or(0), p.get(2).copied().unwrap_or(0));
++  if nibbles {
++    ((a & 0xf) << 12) | ((b & 0xf) << 8) | (c & 0xff)
++  } else {
++    ((a & 0xff) << 8) | (b & 0xff)
++  }
++}
++
++/// Settings Dante Controller asked for that need the device restarted on
++/// them (they are fixed for the lifetime of an Inferno instance). The host
++/// (e.g. inferno-dvs-ctl) watches for this file and applies it.
++#[derive(serde::Serialize, serde::Deserialize, Default, Clone)]
++pub struct ControllerRequest {
++  pub latency_ns: Option<u32>,
++  pub sample_rate: Option<u32>,
++}
++
++pub const CONTROLLER_REQUEST_FILE: &str = "controller_request";
++
++pub fn save_controller_request(storage: &StateStorage, update: impl FnOnce(&mut ControllerRequest)) {
++  let mut req: ControllerRequest = storage.load(CONTROLLER_REQUEST_FILE).unwrap_or_default();
++  update(&mut req);
++  if let Err(e) = storage.save(CONTROLLER_REQUEST_FILE, &req) {
++    error!("unable to save controller request: {e:?}");
++  }
++}
++
+ pub async fn run_server(
+   self_info: Arc<DeviceInfo>,
+   state_storage: Arc<StateStorage>,
+@@ -41,6 +135,8 @@ pub async fn run_server(
+   shutdown: BroadcastReceiver<()>,
+ ) {
+   let mut subscriber = None;
++  let mut pending_latency_ns: Option<u32> = None;
++  let request_storage = state_storage.clone();
+   let mut saved_channels = SavedChannelsSettings::load(state_storage, self_info.clone());
+   let server = UdpSocketWrapper::new(Some(self_info.ip_address), self_info.arc_port, shutdown).await;
+   let mut conn = req_resp::Connection::new(server);
+@@ -91,34 +187,49 @@ pub async fn run_server(
+         }
+ 
+         get_device_names::OPCODE => {
+-          let mut bytes = ByteBuffer::new();
+-          let strings_offset = HEADER_LENGTH;
+-          bytes.write_bytes(&[0u8; get_device_names::ResponseHeader::SERIALIZED_SIZE]);
+-          let friendly_hostname_offset = (bytes.get_wpos() + strings_offset).try_into().unwrap();
+-          bytes.write_bytes(self_info.friendly_hostname.as_bytes());
+-          bytes.write_u8(0);
+-          let factory_hostname_offset = (bytes.get_wpos() + strings_offset).try_into().unwrap();
+-          bytes.write_bytes(self_info.factory_hostname.as_bytes());
+-          bytes.write_u8(0);
+-          let board_name_offset = (bytes.get_wpos() + strings_offset).try_into().unwrap();
+-          bytes.write_bytes(self_info.board_name.as_bytes());
+-          bytes.write_u8(0);
+-          let revision_string_offset = (bytes.get_wpos() + strings_offset).try_into().unwrap();
+-          bytes.write_bytes(b":705\0");
+-
+-          let response = get_device_names::ResponseHeader {
+-            board_name_offset,
+-            revision_string_offset,
+-            friendly_hostname_offset1: friendly_hostname_offset,
+-            factory_hostname_offset,
+-            friendly_hostname_offset2: friendly_hostname_offset,
+-            start_code: 0x2729,
+-            unknown_opcode_1102: 0x1102,
+-            ..Default::default()
++          // The layout real Dante devices emit (a RedNet A16R and AM2 are
++          // byte-identical in structure), not the older guessed one: 48-byte
++          // header, 2 pad bytes, fixed 32-byte friendly and factory name
++          // fields, then board and revision strings. With the wrong shape
++          // Dante Controller shows "Cannot retrieve Device Latency".
++          //   +0 0x001c  +2 0x001c  +4 0x0028  +6 board  +8 revision
++          //   +18 0x0500 +20 friendly +22 factory +24 friendly  +30 0x0a0a
++          //   +34 router version  +38 arcp version  +40 0x0204
++          //   +42 0x1102 (flows start code)  +44 0x1004
++          let fixed32 = |s: &str| {
++            let mut f = [0u8; 32];
++            let b = s.as_bytes();
++            let n = b.len().min(31);
++            f[..n].copy_from_slice(&b[..n]);
++            f
+           };
+-          bytes.set_wpos(0);
+-          bytes.write_bytes(response.binary_serialize_to_array(binary_serde::Endianness::Big).as_slice());
+-          conn.respond(&bytes.as_bytes()).await;
++          let mut c = vec![0u8; 50];
++          let friendly = HEADER_LENGTH + c.len();
++          c.extend_from_slice(&fixed32(&self_info.friendly_hostname));
++          let factory = HEADER_LENGTH + c.len();
++          c.extend_from_slice(&fixed32(&self_info.factory_hostname));
++          let board = HEADER_LENGTH + c.len();
++          c.extend_from_slice(self_info.board_name.as_bytes());
++          c.push(0);
++          let revision = HEADER_LENGTH + c.len();
++          c.extend_from_slice(b":705\0");
++          let mut put = |at: usize, v: u16| c[at..at + 2].copy_from_slice(&v.to_be_bytes());
++          put(0, 0x001c);
++          put(2, 0x001c);
++          put(4, 0x0028);
++          put(6, board as u16);
++          put(8, revision as u16);
++          put(18, 0x0500);
++          put(20, friendly as u16);
++          put(22, factory as u16);
++          put(24, friendly as u16);
++          put(30, 0x0a0a);
++          put(34, version_word(super::mdns_server::ROUTER_VERS, false));
++          put(38, version_word(super::mdns_server::ARCP_VERS, true));
++          put(40, 0x0204);
++          put(42, 0x1102);
++          put(44, 0x1004);
++          conn.respond(&c).await;
+         }
+ 
+         get_receive_channels::OPCODE => {
+@@ -613,41 +724,52 @@ pub async fn run_server(
+         }
+ 
+         0x1100 => {
+-          // used by DC
+-          // received unknown opcode1 0x1100, content 00130201820482050210021182188219830183028306031003110303802100f08060002200630064
+-          // whole packet: "272900320e621100000000130201820482050210021182188219830183028306031003110303802100f08060002200630064"
+-
+-          // ???
+-          // looks like something dependent on active connections
+-          let content = [0u8; 110];
+-          // XXX: not necessary
+-          /* let content = [
+-            0x12, 0x12, 0x02, 0x01, 0x00, 0x01, 0x82, 0x04, 0x00, 0x54, 0x82, 0x05, 0x00, 0x58,
+-            0x02, 0x10, 0x00, 0x10, 0x02, 0x11, 0x00, 0x10, 0x00, 0x00, 0x82, 0x18, 0x00, 0x00,
+-            0x82, 0x19, 0x83, 0x01, 0x00, 0x5c, 0x83, 0x02, 0x00, 0x60, 0x83, 0x06, 0x00, 0x64,
+-            0x03, 0x10, 0x00, 0x10, 0x03, 0x11, 0x00, 0x10, 0x03, 0x03, 0x00, 0x02, 0x80, 0x21,
+-            0x00, 0x68, 0x00, 0x00, 0x00, 0xf0, 0x00, 0x00, 0x80, 0x60, 0x00, 0x22, 0x00, 0x01,
+-            0x00, 0x00, 0x00, 0x63, /* 1000000: */ 0x00, 0x0f, 0x42, 0x40, 0x00, 0x0f, 0x42,
+-            0x40, 0x00, 0x0f, 0x42, 0x40, 0x01, 0x35, 0xf1, 0xb4, 0x00, 0x0f, 0x42, 0x40, 0x00,
+-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+-            0x00,
+-          ]; */
+-          conn.respond(&content).await;
++          let mut table = ARC_1100_TEMPLATE;
++          let latency_ns = pending_latency_ns.unwrap_or(self_info.latency_ns as u32);
++          arc_1100_patch_u32(&mut table, 0x8205, latency_ns);
++          arc_1100_patch_u32(&mut table, 0x8301, latency_ns);
++          arc_1100_patch_u32(&mut table, 0x8306, MIN_LATENCY_NS);
++          arc_1100_patch_u32(&mut table, 0x8020, self_info.sample_rate);
++          conn.respond(&table).await;
+         }
+         0x1102 => {
+-          // identical for all low channels count devices
+-          let content = [0u8; 94];
+-          // XXX not necessary
+-          /* let content = [
+-            /* number of items, 2B: */ 0x00, 0x17, 0x80, 0x20, 0x00, 0x01,
+-            0x80, 0x21, 0x00, 0x03, 0x00, 0x22, 0x00, 0x03, 0x00, 0x23, 0x00, 0x03, 0x00, 0x24, 0x00, 0x01,
+-            0x02, 0x01, 0x00, 0x03, 0x82, 0x04, 0x00, 0x03, 0x82, 0x05, 0x00, 0x03, 0x02, 0x0a, 0x00, 0x01,
+-            0x02, 0x0b, 0x00, 0x01, 0x02, 0x10, 0x00, 0x03, 0x02, 0x11, 0x00, 0x03, 0x02, 0x12, 0x00, 0x03,
+-            0x02, 0x13, 0x00, 0x01, 0x02, 0x14, 0x00, 0x01, 0x83, 0x01, 0x00, 0x03, 0x83, 0x06, 0x00, 0x01,
+-            0x83, 0x02, 0x00, 0x01, 0x03, 0x10, 0x00, 0x01, 0x03, 0x11, 0x00, 0x01, 0x03, 0x03, 0x00, 0x03,
+-            0x83, 0xf0, 0x00, 0x01, 0x06, 0x01, 0x00, 0x01
+-          ]; */
+-          conn.respond(&content).await;
++          conn.respond(&ARC_1102_TABLE).await;
++        }
++        0x1101 => {
++          // Set latency, found by mirroring Dante Controller's Latency tab:
++          // 30 bytes of content, the latency in ns twice at [22..26] and [26..30].
++          let c = request.content();
++          let ok = c.len() >= 30 && {
++            let v1 = u32::from_be_bytes(c[22..26].try_into().unwrap());
++            let v2 = u32::from_be_bytes(c[26..30].try_into().unwrap());
++            if v1 == v2 && (MIN_LATENCY_NS..=40_000_000).contains(&v1) {
++              info!("Dante Controller set latency to {} us", v1 / 1000);
++              pending_latency_ns = Some(v1);
++              save_controller_request(&request_storage, |r| r.latency_ns = Some(v1));
++              true
++            } else {
++              warn!("latency set rejected: {v1} / {v2} ns");
++              false
++            }
++          };
++          if ok {
++            let echo = c.to_vec();
++            conn.respond(&echo).await;
++          } else {
++            conn.respond_with_code(CODE_UNSUPPORTED, &[]).await;
++          }
++        }
++        0x2204 => {
++          // TX flow detail: must be OK and empty, an error makes Dante
++          // Controller retry it about a thousand times a second.
++          conn.respond(&[0u8, 0u8]).await;
++        }
++        0x2032 => {
++          // asked once per Device View open; an A16R and an AM2 both answer this
++          conn.respond(&[0u8, 0u8]).await;
++        }
++        0x4100 => {
++          conn.respond_with_code(0x30, &[]).await;
+         }
+         0x3300 => {
+           // WTF: this is necessary to avoid 'clock domain mismatch' error in DC
+@@ -719,8 +841,9 @@ pub async fn run_server(
+         }
+ 
+         x => {
+-          error!("received unknown opcode1 {x:#04x}, content {}", hex::encode(request.content()));
+-          error!("whole packet: {:?}", hex::encode(request.into_storage()));
++          // Every real device answers every request; 0x22 means unsupported.
++          warn!("unsupported opcode1 {x:#04x}, content {}", hex::encode(request.content()));
++          conn.respond_with_code(CODE_UNSUPPORTED, &[]).await;
+         }
+       }
+     } else {
+diff --git a/inferno_aoip/src/device_server/info_mcast_server.rs b/inferno_aoip/src/device_server/info_mcast_server.rs
+index 1b828b1..f83b9bb 100644
+--- a/inferno_aoip/src/device_server/info_mcast_server.rs
++++ b/inferno_aoip/src/device_server/info_mcast_server.rs
+@@ -22,6 +22,63 @@ use tokio::{
+ };
+ 
+ const SEND_BUFFER_SIZE: usize = 1500;
++
++// Clock statistics (0x0020) as Dante Virtual Soundcard sends them: this is
++// what makes Dante Controller show the device as a PTPv1 follower of the right
++// leader. Patched per reply (see send_clock_stats). Ported from the ESP32 AoIP
++// receiver, where it was verified against Dante Controller.
++const CLOCK_STATS_TEMPLATE: [u8; 148] = [
++  0x00, 0x03, 0x00, 0x03, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xf1, 0x6a, 0xc8, 0xa3, 0x62, 0xeb,
++  0xf8, 0xc8, 0x00, 0x00, 0x00, 0x1d, 0xc1, 0x2d, 0x4a, 0x18, 0x00, 0x00, 0x00, 0x1d, 0xc1, 0x2d,
++  0x4a, 0x18, 0x00, 0x00, 0x00, 0x01, 0x00, 0x34, 0x00, 0x09, 0x00, 0x00, 0x02, 0x34, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x60, 0x0c, 0x00,
++  0x00, 0x00, 0x00, 0x0c, 0x00, 0x78, 0x00, 0x20, 0x00, 0x01, 0x00, 0x00, 0x00, 0x68, 0x10, 0x00,
++  0x00, 0x00, 0x00, 0x01, 0x01, 0x02, 0x01, 0x00, 0x00, 0x00, 0x00, 0x04, 0x00, 0x09, 0x00, 0x07,
++  0x00, 0x01, 0x00, 0x07, 0x00, 0x98, 0x00, 0x04, 0xc8, 0xa3, 0x62, 0xff, 0xfe, 0xeb, 0xf8, 0xc8,
++  0x00, 0x1d, 0xc1, 0xff, 0xfe, 0x2d, 0x4a, 0x18, 0x00, 0x1d, 0xc1, 0xff, 0xfe, 0x2d, 0x4a, 0x18,
++  0x00, 0x01, 0x00, 0x00,
++];
++
++// 0x0084, byte-identical on a RedNet A16R, an AM2 and DVS.
++const CAPS_0084: [u8; 60] = [
++  0x00, 0x30, 0x00, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
++  0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x04,
++];
++
++/// Sample rates advertised to Dante Controller (0x0080). Inferno itself runs
++/// at any rate; changing it restarts the device on the new one.
++const SUPPORTED_RATES: [u32; 4] = [44100, 48000, 88200, 96000];
++
++static PTP_OBSERVATION_PATH: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
++
++/// Statime's observation socket, for sync quality in the heartbeat.
++pub fn set_ptp_observation_path(path: std::path::PathBuf) {
++  let _ = PTP_OBSERVATION_PATH.set(path);
++}
++
++/// (|offset from leader| ns, mean path delay ns) from Statime's observation
++/// socket. Durations there are I96F32 fixed point, serialised as integers.
++fn read_ptp_quality() -> Option<(u64, u64)> {
++  use std::io::Read;
++  let path = PTP_OBSERVATION_PATH.get()?;
++  let mut sock = std::os::unix::net::UnixStream::connect(path).ok()?;
++  sock.set_read_timeout(Some(Duration::from_millis(100))).ok()?;
++  let mut json = String::new();
++  sock.read_to_string(&mut json).ok()?;
++  let field = |name: &str| -> Option<f64> {
++    let at = json.find(&format!("\"{name}\":"))? + name.len() + 3;
++    let rest = json[at..].trim_start();
++    let end = rest.find(|c: char| !(c.is_ascii_digit() || c == '-')).unwrap_or(rest.len());
++    rest[..end].parse::<f64>().ok()
++  };
++  let scale = 4_294_967_296.0; // 2^32
++  let off = field("offset_from_master")? / scale;
++  let delay = field("mean_delay")? / scale;
++  Some((off.abs().round() as u64, delay.max(0.0).round() as u64))
++}
+ const DST_PORT_HEARTBEAT: u16 = 8708;
+ const DST_PORT_DEVICE_INFO: u16 = 8702;
+ 
+@@ -41,6 +98,8 @@ struct Multicaster<'s> {
+   channels_subscriber: Option<Arc<ChannelsSubscriber>>,
+   get_peaks: PeaksCallback,
+   had_clock: bool,
++  pending_rate: Option<u32>,
++  state_storage: crate::state_storage::StateStorage,
+ }
+ 
+ impl<'s> Multicaster<'s> {
+@@ -76,6 +135,8 @@ impl<'s> Multicaster<'s> {
+       channels_subscriber: None,
+       get_peaks,
+       had_clock: false,
++      pending_rate: None,
++      state_storage: crate::state_storage::StateStorage::new(self_info),
+     };
+     write_str_to_buffer(&mut r.vendor, 0, 8, &self_info.vendor_string);
+     return r;
+@@ -100,6 +161,79 @@ impl<'s> Multicaster<'s> {
+     self.server.send(&dst, pkt).await;
+   }
+ 
++  /// Replies must echo the request's sequence number and opcode (only byte 3
++  /// changes), or Dante Controller does not ingest them.
++  async fn send_reply(&mut self, dst: SocketAddr, req: &[u8], reply_op: u8, content: &[u8]) {
++    let seq = u16::from_be_bytes([req[4], req[5]]);
++    let mut opcode: [u8; 8] = req[24..32].try_into().unwrap();
++    opcode[3] = reply_op;
++    let pkt = make_packet(
++      &mut self.send_buffer,
++      0xffff,
++      seq,
++      self.self_info.process_id,
++      self.self_info.factory_device_id,
++      self.vendor,
++      opcode,
++      content,
++    );
++    self.server.send(&dst, pkt).await;
++  }
++
++  /// 0x0080 rate table: item size, count, current rate twice, 0x0002 0x0000,
++  /// then the supported rates (a RedNet AM2's layout).
++  fn rate_table(&self, current: u32) -> Vec<u8> {
++    let mut b = Vec::new();
++    b.extend_from_slice(&0x18u16.to_be_bytes());
++    b.extend_from_slice(&(SUPPORTED_RATES.len() as u16).to_be_bytes());
++    b.extend_from_slice(&current.to_be_bytes());
++    b.extend_from_slice(&current.to_be_bytes());
++    b.extend_from_slice(&[0, 2, 0, 0]);
++    for r in SUPPORTED_RATES {
++      b.extend_from_slice(&r.to_be_bytes());
++    }
++    b
++  }
++
++  async fn send_caps(&mut self, dst: SocketAddr, req: Option<&[u8]>) {
++    let table = self.rate_table(self.pending_rate.unwrap_or(self.self_info.sample_rate));
++    match req {
++      Some(r) => self.send_reply(dst, r, 0x80, &table).await,
++      None => self.send(dst, 0xffff, [0x07, 0x2a, 0x00, 0x80, 0, 0, 0, 0], &table).await,
++    }
++    let bits = self.self_info.bits_per_sample as u32;
++    let mut enc = Vec::new();
++    enc.extend_from_slice(&[0x00, 0x18, 0x00, 0x01]);
++    enc.extend_from_slice(&bits.to_be_bytes());
++    enc.extend_from_slice(&[0, 0, 0, 0, 0, 2, 0, 0]);
++    enc.extend_from_slice(&bits.to_be_bytes());
++    self.send(dst, 0xffff, [0x07, 0x2a, 0x00, 0x82, 0, 0, 0, 0], &enc).await;
++    self.send(dst, 0xffff, [0x07, 0x2a, 0x10, 0x09, 0, 0, 0, 0], &[0u8; 16]).await;
++    self.send(dst, 0xffff, [0x07, 0x2a, 0x00, 0x84, 0, 0, 0, 0], &CAPS_0084).await;
++  }
++
++  /// Rate SET: an 0x81 request carrying u32 1, u32 rate. Inferno cannot change
++  /// rate while running, so the request is saved for the host to apply (it
++  /// restarts the device on the new rate), as a real device reboots onto it.
++  async fn handle_rate_set(&mut self, dst: SocketAddr, req: &[u8]) {
++    let hz = u32::from_be_bytes(req[36..40].try_into().unwrap());
++    if !SUPPORTED_RATES.contains(&hz) {
++      warn!("Dante Controller asked for unsupported rate {hz}");
++      let table = self.rate_table(self.self_info.sample_rate);
++      self.send_reply(dst, req, 0x80, &table).await;
++      return;
++    }
++    info!("Dante Controller set sample rate to {hz} Hz");
++    self.pending_rate = Some(hz);
++    super::arc_server::save_controller_request(&self.state_storage, |r| r.sample_rate = Some(hz));
++    let table = self.rate_table(hz);
++    let mcast = self.device_info_destination;
++    self.send_reply(mcast, req, 0x80, &table).await;
++    // what a RedNet AM2 multicasts when switching rate
++    self.send(mcast, 0xffff, [0x07, 0x2a, 0x01, 0x00, 0, 0, 0, 0], &[1, 1, 0, 0, 0, 0, 0, 2]).await;
++    self.send(mcast, 0xffff, [0x07, 0x2a, 0x01, 0x06, 0, 0, 0, 0], &[]).await;
++  }
++
+   async fn send_board_info(&mut self) {
+     let mut content = [0u8; 200];
+     // Firmware version:
+@@ -124,7 +258,9 @@ impl<'s> Multicaster<'s> {
+     content[0x14] = 0;
+     content[0x15] = 0;
+     content[0x16] = 0x10;
+-    content[0x17] = 0;
++    // 0xdb (a RedNet AM2's value) makes Dante Controller offer sample rate
++    // configuration; 0 makes it say the device does not support it.
++    content[0x17] = 0xdb;
+ 
+     content[0xbb] = 0x1f; // if 0, device is flooded with info multicast requests around 1 per second
+                           /* content[0xbf] = 5;
+@@ -181,6 +317,24 @@ impl<'s> Multicaster<'s> {
+     let freq_offset_opt = self.get_freq_offset_ppb();
+ 
+     if let Some(freq_offset) = freq_offset_opt {
++      // 0x8000: sync quality, |offset from leader| and mean path delay in ns;
++      // Dante Controller's Sync indicator reads this.
++      if let Some((off, delay)) = read_ptp_quality() {
++        bytes.write_u16(36);
++        bytes.write_u16(0x8000);
++        bytes.write_u16(4);
++        bytes.write_u16(4);
++        bytes.write_u16(ctr);
++        bytes.write_u16(0);
++        bytes.write_u16(0x0010);
++        bytes.write_u16(0);
++        bytes.write_u16(1);
++        bytes.write_u16(0x0010);
++        bytes.write_u32(off.min(u32::MAX as u64) as u32);
++        bytes.write_u32(delay.min(u32::MAX as u64) as u32);
++        bytes.write_u32(0);
++        bytes.write_u32(0);
++      }
+       bytes.write_u16(16); // length of this part
+       bytes.write_u16(0x8001); // type
+       bytes.write_u16(4); // ???
+@@ -249,6 +403,23 @@ impl<'s> Multicaster<'s> {
+         }
+       }
+ 
++      // 0x8004: per-flow counters (missed packets); zeros, as the ESP32 sends
++      if let Some(chsub) = self.channels_subscriber.as_ref() {
++        let n = chsub.flows_info().read().unwrap().len() as u16;
++        bytes.write_u16(20 + 4 * n);
++        bytes.write_u16(0x8004);
++        bytes.write_u16(4);
++        bytes.write_u16(8 + 4 * n);
++        bytes.write_u16(ctr);
++        bytes.write_u16(0);
++        bytes.write_u16(n);
++        bytes.write_u16(0);
++        bytes.write_u16(0x0014);
++        bytes.write_u16(0);
++        for _ in 0..n {
++          bytes.write_u32(0);
++        }
++      }
+       /* bytes.write_bytes(&[
+         0x00, 0x1c, 0x80, 0x04,
+         0x00, 0x04, 0x00, 0x10,  H(ctr), L(ctr), 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x14, 0x00, 0x00,
+@@ -299,53 +470,52 @@ impl<'s> Multicaster<'s> {
+     ]).await; */
+   }
+ 
+-  async fn send_clock_stats(&mut self) {
+-    let freq_offset = if let Some(f) = self.get_freq_offset_ppb() {
+-      f
+-    } else {
+-      return;
++  /// Clock statistics in the layout Dante Virtual Soundcard uses:
++  ///   [2..4]  0x0003 locked / 0x0001 not     [8..12] frequency offset, ppb
++  ///   12 / 20 / 28   MAC+0000 of us / grandmaster / parent
++  ///   [40]   0x0009 = IEEE 1588 slave        120 / 128 / 136  EUI-64s
++  /// Always multicast; as a reply it echoes the request's seq and opcode.
++  async fn send_clock_stats(&mut self, req: Option<&[u8]>) {
++    let freq_offset = match self.get_freq_offset_ppb() {
++      Some(f) => f,
++      None => return,
+     };
++    // Statime (inferno-dev fork) writes the current leader's port identity to
++    // /tmp/clock-stats.<our clock id><port> when it becomes a follower.
+     let required_prefix = format!("clock-stats.{}0000", hex::encode(self.self_info.mac_address.octets()));
+-    let mut master_clock = None;
++    let mut master: Option<Vec<u8>> = None;
+     if let Ok(readdir) = std::fs::read_dir("/tmp") {
+-      for entry in readdir {
+-        if let Ok(entry) = entry {
+-          if entry.file_name().to_string_lossy().starts_with(&required_prefix) {
+-            if let Ok(content) = std::fs::read_to_string(entry.path()) {
+-              let content = content.trim_ascii();
+-              if content.len() >= 12 {
+-                if let Ok(master_id) = hex::decode(&content[0..16]) {
+-                  master_clock = Some(master_id);
+-                  break;
+-                }
+-              }
++      for entry in readdir.flatten() {
++        if entry.file_name().to_string_lossy().starts_with(&required_prefix) {
++          if let Ok(content) = std::fs::read_to_string(entry.path()) {
++            let content = content.trim_ascii();
++            if content.len() >= 16 {
++              master = hex::decode(&content[0..16]).ok();
++              break;
+             }
+           }
+         }
+       }
+     }
+-    if let Some(mc) = master_clock {
+-      assert_eq!(mc.len(), 8);
+-      let mut bytes = ByteBuffer::new();
+-      bytes.set_endian(bytebuffer::Endian::BigEndian);
+-      bytes.write_bytes(&[
+-        0x00, 0x03, 0x00, 0x03, /* 0x01 = PLL not locked */
+-        0x00, 0x00, 0x00, 0x9f, /* was 0xff */
+-      ]);
+-      bytes.write_i32(freq_offset);
+-      bytes.write_bytes(&self.self_info.mac_address.octets());
+-      bytes.write_u16(0);
+-      bytes.write_bytes(&mc);
+-      bytes.write_bytes(&mc);
+-      bytes.write_bytes(&[0u8; 76]);
+-      self
+-        .send(
+-          self.device_info_destination,
+-          0xffff,
+-          [0x07, 0x2a, 0x00, 0x20, 0x00, 0x00, 0x00, 0x00],
+-          bytes.as_bytes(),
+-        )
+-        .await;
++    let Some(mc) = master else { return };
++    let mac = self.self_info.mac_address.octets();
++    let mut c = CLOCK_STATS_TEMPLATE;
++    c[2] = 0;
++    c[3] = 0x03; // locked: we have a leader and a clock overlay
++    c[8..12].copy_from_slice(&freq_offset.to_be_bytes());
++    c[12..18].copy_from_slice(&mac);
++    c[18..20].copy_from_slice(&[0, 0]);
++    c[20..28].copy_from_slice(&mc[0..8]);
++    c[28..36].copy_from_slice(&mc[0..8]);
++    // PTPv1 clock ids are MAC+0000; the EUI-64 form is MAC with ff:fe inserted
++    let eui = |m: &[u8]| [m[0], m[1], m[2], 0xff, 0xfe, m[3], m[4], m[5]];
++    c[120..128].copy_from_slice(&self.self_info.factory_device_id);
++    c[128..136].copy_from_slice(&eui(&mc));
++    c[136..144].copy_from_slice(&eui(&mc));
++    let dst = self.device_info_destination;
++    match req {
++      Some(r) => self.send_reply(dst, r, 0x20, &c).await,
++      None => self.send(dst, 0xffff, [0x07, 0x2a, 0x00, 0x20, 0, 0, 0, 0], &c).await,
+     }
+   }
+ 
+@@ -395,7 +565,7 @@ pub async fn run_server(
+   while mcaster.should_work() {
+     select! {
+       r = mcaster.server.recv(&mut recv_buff) => {
+-        let (_src, request_buf) = match r {
++        let (src, request_buf) = match r {
+           Some(v) => v,
+           None => continue
+         };
+@@ -405,14 +575,27 @@ pub async fn run_server(
+         }
+         let opcode = &request_buf[24..32];
+         match opcode {
+-          [0x07, _, 0, 0x61, 0, 0, 0, 0] => {
++          [0x07, _, 0, 0x60 | 0x61, 0, 0, 0, _] => {
+             mcaster.send_board_info().await;
+           },
+-          [0x07, _, 0, 0xc1, 0, 0, 0, 0] => {
++          [0x07, _, 0, 0xc0 | 0xc1, 0, 0, 0, _] => {
+             mcaster.send_product_info().await;
+           },
+           [0x07, _ /* was 0x38 */, 0, 0x21, 0, 0, 0, _ /* was 0x64 */] => {
+-            mcaster.send_clock_stats().await;
++            let req = request_buf.to_vec();
++            mcaster.send_clock_stats(Some(&req)).await;
++          },
++          [0x07, _, 0, 0x81, 0, 0, 0, _] => {
++            // with content u32 1, u32 rate it is a SET; without, a query
++            let req = request_buf.to_vec();
++            if req.len() >= 40 && req[32..36] == [0, 0, 0, 1] {
++              mcaster.handle_rate_set(src, &req).await;
++            } else {
++              mcaster.send_caps(src, Some(&req)).await;
++            }
++          },
++          [0x07, _, 0, 0x83 | 0x85, 0, 0, 0, _] => {
++            mcaster.send_caps(src, None).await;
+           },
+           [0x07, _, 0, 0x13, 0, 0, 0, _] => {
+             mcaster.send_network_info().await;
+diff --git a/inferno_aoip/src/device_server/mdns_server.rs b/inferno_aoip/src/device_server/mdns_server.rs
+index 811b52d..09cf27d 100644
+--- a/inferno_aoip/src/device_server/mdns_server.rs
++++ b/inferno_aoip/src/device_server/mdns_server.rs
+@@ -16,6 +16,10 @@ use crate::{
+   utils::LogAndForget,
+ };
+ 
++/// Versions advertised over mDNS; the 0x1003 reply must carry the same ones.
++pub const ARCP_VERS: &str = "2.7.41";
++pub const ROUTER_VERS: &str = "4.0.2";
++
+ pub struct DeviceMDNSResponder {
+   handle: RwLock<Option<BroadcasterHandle>>,
+   self_info: Arc<DeviceInfo>,
+@@ -56,9 +60,9 @@ impl DeviceMDNSResponder {
+         ServiceBuilder::new(service_type("_netaudio-arc"), hostname.clone(), self_info.arc_port)
+           .unwrap()
+           .add_ip_address(IpAddr::V4(self_info.ip_address))
+-          .add_txt_truncated("arcp_vers=2.7.41")
++          .add_txt_truncated(format!("arcp_vers={ARCP_VERS}"))
+           .add_txt_truncated("arcp_min=0.2.4")
+-          .add_txt_truncated("router_vers=4.0.2")
++          .add_txt_truncated(format!("router_vers={ROUTER_VERS}"))
+           .add_txt_truncated(kv("router_info", &self_info.board_name))
+           .add_txt_truncated(kv("mf", &self_info.manufacturer))
+           .add_txt_truncated(kv("model", &self_info.model_number))
+diff --git a/inferno_aoip/src/device_server/settings.rs b/inferno_aoip/src/device_server/settings.rs
+index 276678d..38a1dba 100644
+--- a/inferno_aoip/src/device_server/settings.rs
++++ b/inferno_aoip/src/device_server/settings.rs
+@@ -184,6 +184,9 @@ impl Settings {
+       .get("USE_SAFE_CLOCK")
+       .map(|s| s.parse().expect("invalid USE_SAFE_CLOCK, must be boolean"))
+       .unwrap_or(false);
++    if let Some(v) = config.get("PTP_OBSERVATION_PATH") {
++      super::info_mcast_server::set_ptp_observation_path(v.into());
++    }
+     if let Some(v) = config.get("TX_TS_OFFSET_NS") {
+       super::flows_tx::set_tx_ts_offset_ns(v.parse().expect("invalid TX_TS_OFFSET_NS, must be integer"));
+     }
+diff --git a/inferno_aoip/src/util/net.rs b/inferno_aoip/src/util/net.rs
+index fd62b35..9c69ca8 100644
+--- a/inferno_aoip/src/util/net.rs
++++ b/inferno_aoip/src/util/net.rs
+@@ -33,9 +33,24 @@ impl UdpSocketWrapper {
+     shutdown: Receiver<()>,
+   ) -> UdpSocketWrapper {
+     let listen_addr = listen_addr.unwrap_or(Ipv4Addr::new(0, 0, 0, 0));
+-    let socket_opt =
+-      UdpSocket::bind(SocketAddr::new(std::net::IpAddr::V4(listen_addr), listen_port)).await;
+-    let socket = socket_opt.expect("error starting really needed listener");
++    let addr = SocketAddr::new(std::net::IpAddr::V4(listen_addr), listen_port);
++    // A host (e.g. PipeWire) may reopen the device right after closing it, while
++    // the previous instance is still shutting down and holds the port. Wait for
++    // it instead of panicking, which left the device half alive.
++    let mut attempts = 0;
++    let socket = loop {
++      match UdpSocket::bind(addr).await {
++        Ok(s) => break s,
++        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse && attempts < 100 => {
++          if attempts == 0 {
++            log::warn!("{addr} still in use, waiting for the previous instance to release it");
++          }
++          attempts += 1;
++          tokio::time::sleep(std::time::Duration::from_millis(100)).await;
++        }
++        Err(e) => panic!("error starting really needed listener on {addr}: {e:?}"),
++      }
++    };
+     // TODO MAY PANIC: this error should be non-fatal because some apps may use Inferno as an optional audio I/O
+     let listen_port = socket.local_addr().unwrap().port();
+     UdpSocketWrapper {

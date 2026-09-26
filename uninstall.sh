@@ -5,7 +5,7 @@ set -uo pipefail
 
 /usr/local/bin/inferno-dvs-ctl default output off 2>/dev/null
 /usr/local/bin/inferno-dvs-ctl default input off 2>/dev/null
-systemctl --user disable --now inferno-dvs.service 2>/dev/null
+systemctl --user disable --now inferno-dvs.service inferno-dvs-requests.path 2>/dev/null
 sudo systemctl disable --now 'inferno-statime@*.service' 2>/dev/null
 
 sudo rm -f /usr/local/bin/inferno-dvs-ctl \
@@ -13,6 +13,8 @@ sudo rm -f /usr/local/bin/inferno-dvs-ctl \
            /usr/local/share/applications/io.github.nickster90s.inferno-dvs.desktop \
            /usr/local/lib/systemd/system/inferno-statime@.service \
            /usr/local/lib/systemd/user/inferno-dvs.service \
+           /usr/local/lib/systemd/user/inferno-dvs-requests.path \
+           /usr/local/lib/systemd/user/inferno-dvs-requests.service \
            /usr/local/libexec/inferno-dvs/statime
 sudo find /usr/local/lib -path '*/inferno-dvs/libasound_module_pcm_inferno.so' -delete
 sudo rm -f "$(pkg-config --variable=indicatorsdir wingpanel 2>/dev/null || echo /usr/lib/x86_64-linux-gnu/wingpanel)/libinferno-dvs.so"

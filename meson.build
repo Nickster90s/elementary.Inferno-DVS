@@ -36,6 +36,9 @@ configure_file(input: 'data/inferno-statime@.service', output: 'inferno-statime@
   configuration: units_conf, install_dir: get_option('prefix') / 'lib/systemd/system')
 configure_file(input: 'data/inferno-dvs.service', output: 'inferno-dvs.service',
   configuration: units_conf, install_dir: get_option('prefix') / 'lib/systemd/user')
+configure_file(input: 'data/inferno-dvs-requests.service', output: 'inferno-dvs-requests.service',
+  configuration: units_conf, install_dir: get_option('prefix') / 'lib/systemd/user')
+install_data('data/inferno-dvs-requests.path', install_dir: get_option('prefix') / 'lib/systemd/user')
 
 install_data('data/' + app_id + '.desktop', install_dir: get_option('datadir') / 'applications')
 

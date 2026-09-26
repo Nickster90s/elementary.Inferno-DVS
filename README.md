@@ -203,6 +203,29 @@ inferno-dvs-ctl interfaces                  # NICs it can use
 
 ## Patches to Inferno
 
+`patches/0003-dante-controller-control-plane.patch` answers Dante Controller
+the way real devices do, so Controller shows and controls the device fully.
+The byte layouts come from the ESP32 and FPGA AoIP projects, where they were
+verified against Controller and against RedNet AM2/A16R and DVS captures:
+
+| Request | Upstream Inferno | With the patch |
+|---|---|---|
+| Device properties 0x1100 / 0x1102 | all zeros, so Controller classifies the device as PTPv2 domain 0 and has no latency options | a RedNet AM2's tables with our latency, a 0.25 ms minimum and our sample rate |
+| Device names 0x1003 | older guessed layout ("Cannot retrieve Device Latency") | the layout real devices send |
+| Set latency 0x1101 | ignored | applied (see below) |
+| Sample rate | "does not support sample rate configuration" | 44.1/48/88.2/96 kHz offered and settable |
+| Clock status 0x20 | fixed seq/opcode that Controller ignores | DVS layout, echoing seq/opcode: PTPv1 follower, leader, frequency offset |
+| Heartbeat | 0x8001–0x8003 | adds 0x8000 sync quality (offset and path delay from Statime) and 0x8004 |
+| 0x2204, 0x2032, 0x4100, unknown opcodes | no reply, so Controller retries | answered as an AM2 does (0x22 = unsupported) |
+| Restart race | a device reopened within a second panicked with "address in use" | waits for the previous instance to release its ports |
+
+Latency and sample rate are fixed while an Inferno instance runs. When
+Controller changes them, Inferno answers at once and writes
+`controller_request.toml` in its state directory. The user unit
+`inferno-dvs-requests.path` notices the file and runs
+`inferno-dvs-ctl apply-requests`, which updates your settings and restarts the
+PipeWire nodes on the new value.
+
 `patches/0002-realtime-threads-and-tx-timestamp-offset.patch` makes Inferno's
 send and receive threads realtime through RealtimeKit when direct
 SCHED_FIFO is not allowed. It also makes the packet timestamp offset
@@ -219,16 +242,13 @@ to searchfire, and uses them for channels and multicast bundles.
 
 ## Known limitations
 
-These are inherited from Inferno:
-
-- Dante Controller shows little device information (model, latency and clock
-  details), because Inferno answers some device-info requests with empty
-  tables.
-- Latency and sample rate cannot be set from Dante Controller, only in this
-  app.
 - It is not compatible with Dante Domain Manager and does not support AES67.
 - On NICs without a PTP hardware clock it uses software timestamps, which
   worked fine in testing.
+- Changing latency or sample rate from Dante Controller restarts the Inferno
+  device, so audio drops for a few seconds, much like a hardware device
+  re-locking. PipeWire apps keep their streams.
+- Meters in Dante Controller are not shown yet.
 
 ## License
 
