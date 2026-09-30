@@ -1,0 +1,114 @@
+TX timing like the macOS engine: early wake + spin, DSCP EF on audio
+
+TX_WAKE_EARLY_NS / TX_SPIN_NS: a late wake-up costs spin time instead of a late packet.
+Audio flow sockets are marked DSCP EF (46) like Dante hardware; a switch
+with Dante QoS otherwise queues them as best effort.
+
+--- a/inferno_aoip/src/device_server/flows_tx.rs
++++ b/inferno_aoip/src/device_server/flows_tx.rs
+@@ -54,6 +54,21 @@
+   TX_TS_OFFSET_NS.store(ns.clamp(-1_000_000, 1_000_000), Ordering::Relaxed);
+ }
+ 
++// How the TX thread waits for a packet deadline (same scheme as the macOS engine). With
++// TX_WAKE_EARLY_NS = 0 it sleeps until the deadline. Otherwise it sleeps until that much before
++// it, then waits on the media clock: short sleeps while more than TX_SPIN_NS remain, then spins.
++// A late wake-up (idle CPU, interrupts held off) then costs spin time instead of a late packet.
++static TX_WAKE_EARLY_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
++static TX_SPIN_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(50_000);
++
++pub fn set_tx_wake_early_ns(ns: u64) {
++  TX_WAKE_EARLY_NS.store(ns.min(2_000_000), Ordering::Relaxed);
++}
++
++pub fn set_tx_spin_ns(ns: u64) {
++  TX_SPIN_NS.store(ns.min(2_000_000), Ordering::Relaxed);
++}
++
+ /// Lag statistics on the media clock: for TX how late each packet actually left,
+ /// for RX how late (relative to its timestamp) each packet arrived.
+ pub(super) struct LagStats {
+@@ -180,6 +195,33 @@
+     self.clock.now_in_timebase(self.sample_rate as u64)
+   }
+ 
++  /// Sleeps until the media clock reaches deadline_ns (see TX_WAKE_EARLY_NS).
++  fn wait_for_deadline(&self, sleep_duration: Duration, deadline_ns: Option<u64>) {
++    let early = Duration::from_nanos(TX_WAKE_EARLY_NS.load(Ordering::Relaxed));
++    let (Some(deadline), false) = (deadline_ns, early.is_zero()) else {
++      std::thread::sleep(sleep_duration);
++      return;
++    };
++    let first = sleep_duration.saturating_sub(early);
++    if !first.is_zero() {
++      std::thread::sleep(first);
++    }
++    let spin_ns = TX_SPIN_NS.load(Ordering::Relaxed) as i64;
++    loop {
++      let Some(now) = self.clock.now_ns() else { return };
++      let remaining = deadline.wrapping_sub(now as u64) as i64;
++      if remaining <= 0 {
++        return;
++      }
++      if remaining > spin_ns {
++        // short steps: one long sleep here could overshoot past the deadline
++        std::thread::sleep(Duration::from_nanos(((remaining - spin_ns) as u64).min(50_000)));
++      } else {
++        std::hint::spin_loop();
++      }
++    }
++  }
++
+   #[inline(always)]
+   fn transmit(&mut self, dither_rng: &mut SmallRng, now: LongClock, process_events: bool) {
+     let mut tmp_samples = [0 as Sample; FPP_MAX as usize];
+@@ -395,7 +437,8 @@
+         self.on_transfer.as_ref().map(|transfer| (transfer.callback)());
+ 
+         if !sleep_duration.is_zero() {
+-          std::thread::sleep(sleep_duration);
++          let deadline_ns = sleep_until.map(|ts| (ts as u128 * 1_000_000_000 / sample_rate as u128) as u64);
++          self.wait_for_deadline(sleep_duration, deadline_ns);
+         }
+         if let Some(now) = self.now() {
+           let process_events = wrapped_diff(now as Clock, next_process_events) >= 0;
+@@ -675,6 +718,24 @@
+         let socket = UdpSocket::bind(SocketAddr::new(IpAddr::V4(self.self_info.ip_address), 0))?;
+         socket.connect(dst_addr)?;
+         socket.set_nonblocking(true)?;
++        // Dante's QoS class for audio (DSCP EF, 46), as hardware devices and the macOS engine mark
++        // it: a switch with Dante QoS otherwise queues our audio as best effort.
++        {
++          use std::os::fd::AsRawFd;
++          let tos: libc::c_int = 46 << 2;
++          let r = unsafe {
++            libc::setsockopt(
++              socket.as_raw_fd(),
++              libc::IPPROTO_IP,
++              libc::IP_TOS,
++              &tos as *const libc::c_int as *const libc::c_void,
++              std::mem::size_of::<libc::c_int>() as libc::socklen_t,
++            )
++          };
++          if r != 0 {
++            warn!("cannot set DSCP EF on TX socket to {dst_addr}: {}", std::io::Error::last_os_error());
++          }
++        }
+         //socket.set_read_timeout(Some(Duration::from_micros(1)))?;
+ 
+         self
+--- a/inferno_aoip/src/device_server/settings.rs
++++ b/inferno_aoip/src/device_server/settings.rs
+@@ -190,6 +190,12 @@
+     if let Some(v) = config.get("TX_TS_OFFSET_NS") {
+       super::flows_tx::set_tx_ts_offset_ns(v.parse().expect("invalid TX_TS_OFFSET_NS, must be integer"));
+     }
++    if let Some(v) = config.get("TX_WAKE_EARLY_NS") {
++      super::flows_tx::set_tx_wake_early_ns(v.parse().expect("invalid TX_WAKE_EARLY_NS, must be integer"));
++    }
++    if let Some(v) = config.get("TX_SPIN_NS") {
++      super::flows_tx::set_tx_spin_ns(v.parse().expect("invalid TX_SPIN_NS, must be integer"));
++    }
+     let tx_source_bit_depth = config
+       .get("TX_SOURCE_BIT_DEPTH")
+       .map(|s| s.parse::<u8>().expect("invalid TX_SOURCE_BIT_DEPTH, must be one of: 16, 24, 32"))

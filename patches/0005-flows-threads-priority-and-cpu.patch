@@ -1,0 +1,86 @@
+TX thread above RX thread; optional CPU pinning (TX_CPU / RX_CPU)
+
+rtkit capped both flows threads at its maximum priority, so on a shared CPU
+the TX thread waited for the RX thread: with an RX flow active, thousands of
+TX packets per 10 s left 200-700 us late. RX now runs one level below TX,
+and each thread can be pinned to its own CPU.
+
+--- a/inferno_aoip/src/util/os.rs
++++ b/inferno_aoip/src/util/os.rs
+@@ -41,6 +41,30 @@
+   direct
+ }
+ 
++/// CPUs for the flows threads (-1: let the scheduler choose). Set with TX_CPU / RX_CPU.
++pub static TX_CPU: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
++pub static RX_CPU: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
++
++/// Pins the current thread to one CPU. The TX and RX threads run at nearly the same realtime
++/// priority; on a shared CPU one waits for the other, which showed up as TX packets sent
++/// 200-700 us late whenever an RX flow was active.
++pub fn pin_current_thread(cpu: &std::sync::atomic::AtomicI32) {
++  let cpu = cpu.load(std::sync::atomic::Ordering::Relaxed);
++  if cpu < 0 {
++    return;
++  }
++  #[cfg(target_os = "linux")]
++  unsafe {
++    let mut set: libc::cpu_set_t = std::mem::zeroed();
++    libc::CPU_SET(cpu as usize, &mut set);
++    if libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set) == 0 {
++      log::info!("thread {} pinned to CPU {cpu}", thread_name());
++    } else {
++      log::warn!("thread {} not pinned to CPU {cpu}: {}", thread_name(), std::io::Error::last_os_error());
++    }
++  }
++}
++
+ fn thread_name() -> String {
+   std::thread::current().name().unwrap_or("?").to_owned()
+ }
+@@ -92,7 +116,9 @@
+       .ok()
+       .and_then(|s| s.split_whitespace().nth(1).and_then(|v| v.parse::<u32>().ok()))
+       .unwrap_or(20);
+-    let prio = hint.min(max).max(1);
++    // rtkit caps every hint at its maximum; keep the hints' order below it so the
++    // TX thread (hint 81) ranks above the RX thread (80) and can always preempt it
++    let prio = max.saturating_sub(81u32.saturating_sub(hint)).max(1);
+     let pid = std::process::id().to_string();
+     let tid = unsafe { libc::gettid() }.to_string();
+     let prio_s = prio.to_string();
+--- a/inferno_aoip/src/device_server/flows_tx.rs
++++ b/inferno_aoip/src/device_server/flows_tx.rs
+@@ -393,6 +393,7 @@
+     drop(now);
+ 
+     set_current_thread_realtime(81);
++    crate::util::os::pin_current_thread(&crate::util::os::TX_CPU);
+     loop {
+       let min_next_ts = self
+         .flows
+--- a/inferno_aoip/src/device_server/flows_rx.rs
++++ b/inferno_aoip/src/device_server/flows_rx.rs
+@@ -203,6 +203,7 @@
+     let mut start_timestamp = None;
+ 
+     set_current_thread_realtime(80);
++    crate::util::os::pin_current_thread(&crate::util::os::RX_CPU);
+     loop {
+       let write_to_rbs =
+         self.sockets.iter().find(|opt| opt.is_some()).is_some() || self.silence_writers.len() > 0;
+--- a/inferno_aoip/src/device_server/settings.rs
++++ b/inferno_aoip/src/device_server/settings.rs
+@@ -190,6 +190,12 @@
+     if let Some(v) = config.get("TX_TS_OFFSET_NS") {
+       super::flows_tx::set_tx_ts_offset_ns(v.parse().expect("invalid TX_TS_OFFSET_NS, must be integer"));
+     }
++    if let Some(v) = config.get("TX_CPU") {
++      crate::util::os::TX_CPU.store(v.parse().expect("invalid TX_CPU, must be integer"), std::sync::atomic::Ordering::Relaxed);
++    }
++    if let Some(v) = config.get("RX_CPU") {
++      crate::util::os::RX_CPU.store(v.parse().expect("invalid RX_CPU, must be integer"), std::sync::atomic::Ordering::Relaxed);
++    }
+     if let Some(v) = config.get("TX_WAKE_EARLY_NS") {
+       super::flows_tx::set_tx_wake_early_ns(v.parse().expect("invalid TX_WAKE_EARLY_NS, must be integer"));
+     }

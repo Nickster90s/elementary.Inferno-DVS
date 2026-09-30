@@ -77,7 +77,7 @@ index 9d8cec3..62e6832 100644
 +const MAX_LAG_FLOOR_NS: u64 = 10_000_000;
 +
 +pub fn set_tx_ts_offset_ns(ns: i64) {
-+  TX_TS_OFFSET_NS.store(ns.min(0), Ordering::Relaxed);
++  TX_TS_OFFSET_NS.store(ns.clamp(-1_000_000, 1_000_000), Ordering::Relaxed);
 +}
 +
 +/// Lag statistics on the media clock: for TX how late each packet actually left,

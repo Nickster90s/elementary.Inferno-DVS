@@ -288,6 +288,18 @@ public class InfernoDvs.MainWindow : Gtk.ApplicationWindow {
         default_in_switch.active = s.default_input;
         default_out_switch.sensitive = s.running && s.tx_channels > 0;
         default_in_switch.sensitive = s.running && s.rx_channels > 0;
+        /* Dante Controller (and the command line) can change the settings too:
+           follow them, unless the form holds edits not applied yet. */
+        if (!dirty) {
+            if (!name_entry.has_focus) {
+                name_entry.text = s.name;
+            }
+            rx_spin.value = s.rx_channels;
+            tx_spin.value = s.tx_channels;
+            rate_drop.selected = index_of_rate (s.sample_rate);
+            latency_drop.selected = index_of_latency (s.latency_ms);
+            quantum_drop.selected = index_of_quantum (s.pw_quantum);
+        }
         loading = false;
 
         title_label.label = s.name;
@@ -363,7 +375,8 @@ public class InfernoDvs.MainWindow : Gtk.ApplicationWindow {
                 "rx_channels=%d".printf ((int) rx_spin.value),
                 "tx_channels=%d".printf ((int) tx_spin.value),
                 "sample_rate=%d".printf (RATES[rate_drop.selected]),
-                "latency_ms=%g".printf (LATENCIES[latency_drop.selected]),
+                /* not printf: that follows the locale and writes 0,5 on a Dutch system */
+                "latency_ms=" + LATENCIES[latency_drop.selected].format (new char[double.DTOSTR_BUF_SIZE], "%g"),
                 "pw_quantum=%d".printf (QUANTA[quantum_drop.selected])
             });
             dirty = false;

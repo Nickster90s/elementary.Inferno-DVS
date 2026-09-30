@@ -1,0 +1,54 @@
+searchfire: announce all mDNS records at start-up
+
+searchfire only answered queries, so after a restart with a new latency or
+sample rate Dante Controller kept the cached TXT records (TTL up to 4500 s).
+Now the records go out unsolicited after 0, 1 and 3 s (RFC 6762 8.3); they
+carry the cache-flush bit, so peers replace the old ones.
+
+--- a/searchfire/src/broadcast.rs
++++ b/searchfire/src/broadcast.rs
+@@ -149,14 +149,42 @@
+ 		config: Arc<RwLock<BroadcasterConfig>>,
+ 		shutdown_rx: Option<tokio::sync::oneshot::Receiver<()>>,
+ 	) {
++		let serve = async { tokio::join!(Self::recv_loop(tx, &mut rx, &config), Self::announce(tx, &config)) };
+ 		if let Some(shutdown_rx) = shutdown_rx {
+ 			tokio::select! {
+ 				biased;
+-				_ = Self::recv_loop(tx, &mut rx, &config) => (),
++				_ = serve => (),
+ 				_ = shutdown_rx => (),
+ 			}
+ 		} else {
+-			Self::recv_loop(tx, &mut rx, &config).await
++			serve.await;
++		}
++	}
++
++	/// Announces all records unsolicited at start-up (RFC 6762 section 8.3: at
++	/// least twice, one second apart; here after 0, 1 and 3 s). The records
++	/// carry the cache-flush bit, so peers replace what they cached from a
++	/// previous run: a restart with a new sample rate or latency is seen at
++	/// once, instead of when the old records expire.
++	#[allow(clippy::await_holding_lock)]
++	async fn announce(tx: &AsyncMdnsSocket, config: &RwLock<BroadcasterConfig>) {
++		for delay_s in [0u64, 1, 2] {
++			tokio::time::sleep(std::time::Duration::from_secs(delay_s)).await;
++			let packets: Vec<Vec<u8>> = config
++				.read()
++				.unwrap()
++				.services
++				.iter()
++				.filter_map(|service| {
++					let mut buf = Vec::with_capacity(512);
++					service.dns_response.emit(&mut BinEncoder::new(&mut buf)).ok().map(|_| buf)
++				})
++				.collect();
++			for packet in packets {
++				if let Err(err) = tx.send_multicast(&packet).await {
++					log::warn!("Failed to send mDNS announcement: {err}");
++				}
++			}
+ 		}
+ 	}
+ 

@@ -67,7 +67,11 @@ DEFAULTS = {
     # How far in the past packets are stamped relative to when they are sent.
     # Inferno's default is -500 us; with realtime send threads far less is
     # needed, and every microsecond here is latency receivers must absorb.
-    "tx_ts_offset_us": "-100",
+    "tx_ts_offset_us": "0",
+    "tx_wake_early_us": "300",
+    "tx_spin_us": "50",
+    "tx_cpu": "auto",
+    "rx_cpu": "auto",
     # PipeWire buffer (quantum) the Inferno nodes ask for, in samples at the
     # Dante sample rate. This is local latency on top of the Dante latency.
     "pw_quantum": "1024",
@@ -122,15 +126,25 @@ def validated(cfg):
     out["sample_rate"] = int(out["sample_rate"])
     if out["sample_rate"] not in SAMPLE_RATES:
         raise ValueError(f"sample_rate must be one of {SAMPLE_RATES}")
-    out["latency_ms"] = float(out["latency_ms"])
+    # a comma decimal separator may come from a localised GUI or config
+    out["latency_ms"] = float(str(out["latency_ms"]).replace(",", "."))
     if not 0.25 <= out["latency_ms"] <= 40:
         raise ValueError("latency_ms must be 0.25..40")
     out["pw_quantum"] = int(out["pw_quantum"])
     if out["pw_quantum"] not in PW_QUANTA:
         raise ValueError(f"pw_quantum must be one of {PW_QUANTA}")
     out["tx_ts_offset_us"] = int(float(out["tx_ts_offset_us"]))
-    if not -1000 <= out["tx_ts_offset_us"] <= 0:
-        raise ValueError("tx_ts_offset_us must be -1000..0")
+    if not -1000 <= out["tx_ts_offset_us"] <= 1000:
+        raise ValueError("tx_ts_offset_us must be -1000..1000")
+    for key in ("tx_cpu", "rx_cpu"):
+        v = str(out[key]).strip()
+        if v != "auto" and not (v.lstrip("-").isdigit() and -1 <= int(v) < (os.cpu_count() or 1)):
+            raise ValueError(f"{key} must be auto, -1 (off) or a CPU number")
+        out[key] = v
+    for key in ("tx_wake_early_us", "tx_spin_us"):
+        out[key] = int(float(out[key]))
+        if not 0 <= out[key] <= 2000:
+            raise ValueError(f"{key} must be 0..2000")
     name = "".join(c for c in out["name"] if c.isalnum() or c == "-")[:31]
     out["name"] = name or default_name()
     return out
@@ -195,6 +209,35 @@ def find_existing(candidates):
 
 # ---------------------------------------------------------------- ALSA
 
+def new_process_id():
+    """A new mDNS "process" id on every start, as a real device or Audinate's
+    DVS announces after a restart. With the fixed 0, Dante Controller never
+    noticed a restart, kept its cached latency and even wrote that old value
+    back when its Latency tab was opened."""
+    return int.from_bytes(os.urandom(2), "big") % 65535 + 1
+
+
+def watch_requests(devid):
+    """Point inferno-dvs-requests.path at this device's request file.
+
+    The unit's PathExistsGlob only watches the inferno_aoip/ directory itself,
+    so a request written into an existing device folder went unnoticed (Dante
+    Controller changed the latency, the settings did not follow). A concrete
+    PathExists= watches the file's own directory.
+    """
+    if not devid:
+        return
+    drop = XDG_CONFIG / "systemd" / "user" / "inferno-dvs-requests.path.d"
+    f = drop / "device.conf"
+    want = f"[Path]\nPathExists=%h/.local/state/inferno_aoip/{devid}/controller_request.toml\n"
+    if f.exists() and f.read_text() == want:
+        return
+    drop.mkdir(parents=True, exist_ok=True)
+    f.write_text(want)
+    systemctl("daemon-reload", user=True)
+    systemctl("restart", "inferno-dvs-requests.path", user=True)
+
+
 def write_alsa_conf(cfg):
     # INFERNO_DVS_PLUGIN: developer override, e.g. a fresh cargo build.
     plugin = os.environ.get("INFERNO_DVS_PLUGIN") or find_existing(PLUGIN_CANDIDATES)
@@ -208,6 +251,7 @@ pcm.{PCM_NAME} {{
 	type inferno
 	NAME "{cfg['name']}"
 	DEVICE_ID "{device_id(cfg['interface'])}"
+	PROCESS_ID "{new_process_id()}"
 	BIND_IP "{cfg['interface']}"
 	SAMPLE_RATE "{cfg['sample_rate']}"
 	RX_CHANNELS "{cfg['rx_channels']}"
@@ -215,6 +259,10 @@ pcm.{PCM_NAME} {{
 	RX_LATENCY_NS "{lat_ns}"
 	TX_LATENCY_NS "{lat_ns}"
 	TX_TS_OFFSET_NS "{cfg['tx_ts_offset_us'] * 1000}"
+	TX_WAKE_EARLY_NS "{cfg['tx_wake_early_us'] * 1000}"
+	TX_SPIN_NS "{cfg['tx_spin_us'] * 1000}"
+	TX_CPU "{flows_cpus(cfg)[0]}"
+	RX_CPU "{flows_cpus(cfg)[1]}"
 	CLOCK_PATH "{USRVCLOCK_SOCK}"
 	PTP_OBSERVATION_PATH "{OBSERVE_SOCK}"
 	hint {{
@@ -225,6 +273,7 @@ pcm.{PCM_NAME} {{
 """
     CONF_DIR.mkdir(parents=True, exist_ok=True)
     ALSA_CONF.write_text(body)
+    watch_requests(device_id(cfg["interface"]))
 
     include = f"<{ALSA_CONF}>"
     ALSA_USER_RC.parent.mkdir(parents=True, exist_ok=True)
@@ -321,6 +370,26 @@ def node_id_by_name(name):
         if props.get("node.name") == name:
             return o["id"]
     return None
+
+
+def flows_cpus(cfg):
+    """CPUs for the flows TX and RX threads. auto: TX on the last CPU, RX on the
+    last CPU of another physical core, so the two never share a core (they run at
+    nearly the same realtime priority and would otherwise wait for each other)."""
+    def core(cpu):
+        try:
+            with open(f"/sys/devices/system/cpu/cpu{cpu}/topology/thread_siblings_list") as f:
+                return f.read().strip()
+        except OSError:
+            return str(cpu)
+    n = os.cpu_count() or 1
+    tx = n - 1 if cfg["tx_cpu"] == "auto" else int(cfg["tx_cpu"])
+    if cfg["rx_cpu"] != "auto":
+        return tx, int(cfg["rx_cpu"])
+    if tx < 0 or n < 2:
+        return tx, -1
+    rx = next((c for c in range(n - 1, -1, -1) if core(c) != core(tx)), -1)
+    return tx, rx
 
 
 def set_default(kind, on):

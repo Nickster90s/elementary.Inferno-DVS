@@ -94,6 +94,26 @@ every few seconds. To get rid of the stalls themselves:
   `info` unless `RUST_LOG` is set.
 - check the BIOS for C-state and power-saving options if stalls remain.
 
+### USB network adapters and other drivers
+
+Measured on 2026-09-29/30 with a UGREEN AX88179B (CDC-NCM) at 96 kHz, 1 ms
+latency. The peak minus average at a DirectOut EXBOX went from about 5 ms to
+**0.14 ms**, tighter than a hardware Dante sender into a RedNet AM2. What mattered:
+
+| Problem | Fix |
+|---|---|
+| `cdc_ncm` holds each outgoing frame up to 400 µs to batch it | `tx_timer_usecs=0`: `/etc/udev/rules.d/90-inferno-dvs-usbnet.rules` (also turns off USB 3 link power management for the adapter) |
+| `cdc_ncm` uses a 16 KB buffer per packet; freeing them sometimes waits ~350 µs on the page allocator | `rx_max=2048`, `tx_max=2048` (same udev rule; one Dante packet per NTB needs far less) |
+| Realtek RTL8852BE Wi-Fi (`rtw89`) stalls a CPU core ~3 ms every few seconds | `options rtw89_core disable_ps_mode=Y` in `/etc/modprobe.d/rtw89-lowlatency.conf`, **and keep Wi-Fi switched on** (while it is off, the driver polls the sleeping chip) |
+| amdgpu's vblank switch-off keeps interrupts off up to ~0.6 ms | boot option `drm.vblankoffdelay=0` |
+| Send thread wakes late | wakes 300 µs early and spins (`tx_wake_early_us`, `tx_spin_us`) |
+| Receive and send threads blocked each other on one core | send thread one realtime level above receive, each on its own CPU (`tx_cpu`, `rx_cpu`, `auto` by default) |
+
+Find such stalls with the kernel's `timerlat` tracer (`print_stack`) and a
+trace of the flows TX thread. `tools/tx-probe.py` measures the path from
+`send()` to the PTP leader with the leader's hardware timestamps.
+Details: `docs/LINUX_REFERENCE_FINDINGS.md` in osx.N-Series.AoIP.
+
 ## How it works
 
 ```
@@ -193,7 +213,8 @@ switches, or pick the device inside your app. Apps with their own device list
 inferno-dvs-ctl status                      # state and config (keyfile format)
 inferno-dvs-ctl start | stop | restart      # PipeWire nodes on/off
 inferno-dvs-ctl set rx_channels=16 tx_channels=16 sample_rate=48000 latency_ms=1
-inferno-dvs-ctl set pw_quantum=128 tx_ts_offset_us=-100
+inferno-dvs-ctl set pw_quantum=128 tx_ts_offset_us=0
+inferno-dvs-ctl set tx_wake_early_us=300 tx_spin_us=50 tx_cpu=auto rx_cpu=auto
 inferno-dvs-ctl clock-on | clock-off        # PTP daemon for the configured NIC
 inferno-dvs-ctl default output on|off       # use as system sink
 inferno-dvs-ctl default input on|off        # use as system source
@@ -248,6 +269,16 @@ Controller changes them, Inferno answers at once and writes
 `inferno-dvs-ctl apply-requests`, which updates your settings and restarts the
 PipeWire nodes on the new value.
 
+`patches/0005-flows-threads-priority-and-cpu.patch` ranks the send thread one
+realtime level above the receive thread (RealtimeKit gave both its maximum),
+and pins each to its own CPU (`TX_CPU`, `RX_CPU`). Without it, an active
+receive flow made thousands of sent packets per 10 s leave 0.2–0.7 ms late.
+
+`patches/0004-tx-timing-like-macos.patch` wakes the send thread 300 µs before
+each deadline and waits the rest on the media clock (short sleeps, then a spin),
+as the macOS engine does (`TX_WAKE_EARLY_NS`, `TX_SPIN_NS`). It also marks audio
+packets DSCP EF like Dante hardware.
+
 `patches/0002-realtime-threads-and-tx-timestamp-offset.patch` makes Inferno's
 send and receive threads realtime through RealtimeKit when direct
 SCHED_FIFO is not allowed. It also makes the packet timestamp offset
@@ -270,6 +301,13 @@ to searchfire, and uses them for channels and multicast bundles.
 - Changing latency or sample rate from Dante Controller restarts the Inferno
   device, so audio drops for a few seconds, much like a hardware device
   re-locking. PipeWire apps keep their streams.
+- After changing the latency in the app, refresh Dante Controller (F5) before
+  opening its Latency tab. Inferno announces the new value over mDNS (with a
+  new process id), but Controller only re-reads it on a refresh; opening the
+  Latency tab with a stale value sends that old value back to the device.
+- Receive latency: 1 ms is stable with a USB adapter on the test machine;
+  0.5 ms is not (about 1.4 % of packets are processed late in the USB network
+  driver). Other devices can receive from this one at 0.5 ms.
 
 ## License
 
