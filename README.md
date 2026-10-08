@@ -269,6 +269,15 @@ Controller changes them, Inferno answers at once and writes
 `inferno-dvs-ctl apply-requests`, which updates your settings and restarts the
 PipeWire nodes on the new value.
 
+`patches/0008-mdns-paced-responses.patch` stops searchfire's mDNS bursts.
+A Dante receiver refreshing its cache asks about every channel in one query
+(every ~96 s), and searchfire answered each question with its own packet: 60+
+multicast packets within 3 ms. On a 100 Mbit port (an ESP32 receiver) that
+queued ~2.5 ms in front of the audio, and every refresh made packets late at
+1 ms latency. Now one query gets one merged answer, split at 1400 bytes and
+sent 1 ms apart: 8 packets instead of 64 for 64 channels. Start-up
+announcements go out the same way.
+
 `patches/0005-flows-threads-priority-and-cpu.patch` ranks the send thread one
 realtime level above the receive thread (RealtimeKit gave both its maximum),
 and pins each to its own CPU (`TX_CPU`, `RX_CPU`). Without it, an active

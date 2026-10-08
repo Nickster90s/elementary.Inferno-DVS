@@ -1,0 +1,288 @@
+searchfire: answer a multi-question query with few, paced packets
+
+A Dante receiver refreshing its cache asks about every channel in one query
+(60+ questions, every ~96 s at 80 % of the 120 s TTL). searchfire answered
+each question with its own packet: 60+ multicast packets in ~3 ms. On a
+100 Mbit port that burst queued ~2.5 ms in front of the audio, and an ESP32
+receiver at 1 ms latency dropped 4-8 packets on every refresh.
+
+Now all matching services are merged into one response, duplicates (the
+shared host A record) dropped, split at 1400 B and sent 1 ms apart. The
+start-up announcements go out the same way. 64 channels: 8 packets instead
+of 64. Same fix as osx.N-Series.AoIP a9a3081.
+
+--- a/searchfire/src/broadcast.rs
++++ b/searchfire/src/broadcast.rs
+@@ -85,6 +85,68 @@
+ pub use handle::BroadcasterHandle;
+ use handle::*;
+ 
++/// Largest response we build. Stays under a 1500-byte MTU with the IP and UDP
++/// headers, so no mDNS response is ever fragmented.
++const MAX_PACKET: usize = 1400;
++
++/// Gap between the packets of one multi-packet response. A 1400-byte packet
++/// takes 0.11 ms on a 100 Mbit link, so at 1 ms apart a slow port never builds
++/// a queue in front of the audio sharing it.
++const PACKET_SPACING: std::time::Duration = std::time::Duration::from_millis(1);
++
++/// Merges per-service responses into as few packets as fit [`MAX_PACKET`],
++/// dropping records already present (every channel service carries the same
++/// host address record).
++fn pack_responses<'a>(responses: impl Iterator<Item = &'a DnsMessage>) -> Vec<Vec<u8>> {
++	fn new_message(template: &DnsMessage) -> DnsMessage {
++		let mut message = DnsMessage::new();
++		message.set_header(*template.header());
++		message
++	}
++	fn encode(message: &DnsMessage) -> Option<Vec<u8>> {
++		// emit() writes the header counts from the record lists itself.
++		let mut buf = Vec::with_capacity(MAX_PACKET);
++		message.emit(&mut BinEncoder::new(&mut buf)).ok().map(|_| buf)
++	}
++
++	let mut packets = Vec::new();
++	let mut current: Option<DnsMessage> = None;
++	for response in responses {
++		let mut candidate = current.clone().unwrap_or_else(|| new_message(response));
++		let before = (candidate.answers().len(), candidate.additionals().len());
++		for record in response.answers() {
++			if !candidate.answers().contains(record) {
++				candidate.answers_mut().push(record.clone());
++			}
++		}
++		for record in response.additionals() {
++			if !candidate.answers().contains(record) && !candidate.additionals().contains(record) {
++				candidate.additionals_mut().push(record.clone());
++			}
++		}
++		if (candidate.answers().len(), candidate.additionals().len()) == before {
++			continue; // nothing new
++		}
++		match encode(&mut candidate) {
++			Some(buf) if buf.len() <= MAX_PACKET => current = Some(candidate),
++			_ => {
++				// Full: send what we have and start a new packet with this service.
++				if let Some(mut full) = current.take() {
++					packets.extend(encode(&mut full));
++				}
++				let mut fresh = new_message(response);
++				*fresh.answers_mut() = response.answers().to_vec();
++				*fresh.additionals_mut() = response.additionals().to_vec();
++				current = Some(fresh);
++			}
++		}
++	}
++	if let Some(mut last) = current {
++		packets.extend(encode(&mut last));
++	}
++	packets
++}
++
+ pub(crate) struct BroadcasterConfig {
+ 	services: BTreeSet<ServiceDnsResponse>,
+ }
+@@ -170,18 +232,12 @@
+ 	async fn announce(tx: &AsyncMdnsSocket, config: &RwLock<BroadcasterConfig>) {
+ 		for delay_s in [0u64, 1, 2] {
+ 			tokio::time::sleep(std::time::Duration::from_secs(delay_s)).await;
+-			let packets: Vec<Vec<u8>> = config
+-				.read()
+-				.unwrap()
+-				.services
+-				.iter()
+-				.filter_map(|service| {
+-					let mut buf = Vec::with_capacity(512);
+-					service.dns_response.emit(&mut BinEncoder::new(&mut buf)).ok().map(|_| buf)
+-				})
+-				.collect();
+-			for packet in packets {
+-				if let Err(err) = tx.send_multicast(&packet).await {
++			let packets = pack_responses(config.read().unwrap().services.iter().map(|s| &s.dns_response));
++			for (i, packet) in packets.iter().enumerate() {
++				if i > 0 {
++					tokio::time::sleep(PACKET_SPACING).await;
++				}
++				if let Err(err) = tx.send_multicast(packet).await {
+ 					log::warn!("Failed to send mDNS announcement: {err}");
+ 				}
+ 			}
+@@ -192,7 +248,6 @@
+ 	// It's fine to hold the lock in this case because we're using the current-thread runtime.
+ 	// The future just won't be Send.
+ 	async fn recv_loop(tx: &AsyncMdnsSocket, rx: &mut MdnsSocketRecv<'_>, config: &RwLock<BroadcasterConfig>) {
+-		let mut send_buf = vec![0u8; 4096];
+ 		loop {
+ 			let ((count, addr), packet) = match rx.recv_multicast().await {
+ 				Ok(recv) => recv,
+@@ -210,47 +265,137 @@
+ 				_ => continue,
+ 			};
+ 
+-			for query in message.queries() {
+-				// Many services (e.g. one per audio channel) share one host name;
+-				// answer a host-name (A/AAAA) query with just one of them.
+-				let mut host_answered = false;
+-				for service in config.read().unwrap().services.iter().filter(|service| {
+-					if service.service_type() == query.name() {
+-						return true;
+-					}
+-					if service.service_id() == query.name() {
+-						return true;
+-					}
+-					if service.service_hostname() == query.name() && !host_answered {
+-						host_answered = true;
+-						return true;
+-					}
+-
+-					if let Some(subtype_suffix) = &service.service_subtype_suffix {
+-						if query.name().to_utf8().ends_with(subtype_suffix) {
++			// Collect every service this message asks about -- across ALL its
++			// questions -- before answering, then answer them together.
++			//
++			// This used to send one full packet per question per service. A
++			// Dante receiver refreshing its cache asks about every channel in a
++			// single query (60+ questions), so the answer was 60+ multicast
++			// packets inside ~3 ms, every ~96 s (80 % of the 120 s TTL). That
++			// burst queues ~2.5 ms deep on any 100 Mbit port in front of the
++			// audio, and an ESP32 receiver at 1 ms latency dropped audio on
++			// every one of them.
++			let (unicast, multicast) = {
++				let config = config.read().unwrap();
++				let mut unicast: Vec<&DnsMessage> = Vec::new();
++				let mut multicast: Vec<&DnsMessage> = Vec::new();
++				for query in message.queries() {
++					// Many services (e.g. one per audio channel) share one host name;
++					// answer a host-name (A/AAAA) query with just one of them.
++					let mut host_answered = false;
++					for service in config.services.iter().filter(|service| {
++						if service.service_type() == query.name() {
++							return true;
++						}
++						if service.service_id() == query.name() {
++							return true;
++						}
++						if service.service_hostname() == query.name() && !host_answered {
++							host_answered = true;
+ 							return true;
+ 						}
+-					}
+ 
+-					false
+-				}) {
+-					send_buf.clear();
+-
+-					if service.dns_response.emit(&mut BinEncoder::new(&mut send_buf)).is_ok() {
+-						if query.mdns_unicast_response() {
+-							// Send unicast packet
+-							if let Err(err) = tx.send_to(&send_buf, addr).await {
+-								log::warn!("Failed to send unicast mDNS response to {addr}: {err}");
+-							}
+-						} else {
+-							// Send multicast packet
+-							if let Err(err) = tx.send_multicast(&send_buf).await {
+-								log::warn!("Failed to send multicast mDNS response (requested by {addr}): {err}");
++						if let Some(subtype_suffix) = &service.service_subtype_suffix {
++							if query.name().to_utf8().ends_with(subtype_suffix) {
++								return true;
+ 							}
+ 						}
++
++						false
++					}) {
++						let list = if query.mdns_unicast_response() { &mut unicast } else { &mut multicast };
++						if !list.iter().any(|r| std::ptr::eq(*r, &service.dns_response)) {
++							list.push(&service.dns_response);
++						}
+ 					}
+ 				}
++				(pack_responses(unicast.into_iter()), pack_responses(multicast.into_iter()))
++			};
++
++			for (i, packet) in unicast.iter().enumerate() {
++				if i > 0 {
++					tokio::time::sleep(PACKET_SPACING).await;
++				}
++				if let Err(err) = tx.send_to(packet, addr).await {
++					log::warn!("Failed to send unicast mDNS response to {addr}: {err}");
++				}
++			}
++			for (i, packet) in multicast.iter().enumerate() {
++				if i > 0 || !unicast.is_empty() {
++					tokio::time::sleep(PACKET_SPACING).await;
++				}
++				if let Err(err) = tx.send_multicast(packet).await {
++					log::warn!("Failed to send multicast mDNS response (requested by {addr}): {err}");
++				}
++			}
++		}
++	}
++}
++
++#[cfg(test)]
++mod pack_tests {
++	use super::*;
++	use std::net::{IpAddr, Ipv4Addr};
++	use trust_dns_client::rr::Name as DnsName;
++
++	fn channel_responses(n: usize) -> Vec<DnsMessage> {
++		(1..=n)
++			.map(|i| {
++				// Built the way inferno's mdns_server.rs builds a channel service.
++				let ty = DnsName::from_labels(["_netaudio-chan", "_udp", "local"]).unwrap();
++				let name = DnsName::from_labels([format!("TX {i}@N-Series-AoIP-1584").as_bytes()]).unwrap();
++				ServiceBuilder::new(ty, name, 4455)
++					.unwrap()
++					.hostname(DnsName::from_labels(["N-Series-AoIP-1584"]).unwrap())
++					.unwrap()
++					.add_ip_address(IpAddr::V4(Ipv4Addr::new(169, 254, 231, 218)))
++					.add_txt_truncated("txtvers=2")
++					.add_txt_truncated(format!("id={i}"))
++					.add_txt_truncated("rate=96000")
++					.add_txt_truncated("latency_ns=1000000")
++					.add_txt_truncated("fpp=32,32")
++					.build()
++					.unwrap()
++					.dns_response()
++					.unwrap()
++			})
++			.collect()
++	}
++
++	#[test]
++	fn sixty_four_channels_pack_into_few_packets_without_losing_records() {
++		let responses = channel_responses(64);
++		let packets = pack_responses(responses.iter());
++
++		let single: usize = responses.iter().map(|r| r.to_vec().unwrap().len()).sum();
++		let packed: usize = packets.iter().map(Vec::len).sum();
++		println!("{} packets, {packed} B (was {} packets, {single} B)", packets.len(), responses.len());
++
++		assert!(packets.len() < responses.len() / 4);
++		assert!(packets.iter().all(|p| p.len() <= MAX_PACKET));
++
++		// Every record of every service arrives, and the shared host address once per packet.
++		let mut got = Vec::new();
++		for p in &packets {
++			let m = DnsMessage::from_bytes(p).unwrap();
++			let a = m.answers().iter().chain(m.additionals()).filter(|r| r.rr_type() == trust_dns_client::rr::RecordType::A).count();
++			assert_eq!(a, 1);
++			got.extend(m.answers().iter().chain(m.additionals()).cloned());
++		}
++		for r in &responses {
++			for rec in r.answers().iter().chain(r.additionals()) {
++				assert!(got.contains(rec), "missing {rec:?}");
+ 			}
+ 		}
+ 	}
++
++	#[test]
++	fn one_service_is_one_packet_as_before() {
++		let responses = channel_responses(1);
++		let packets = pack_responses(responses.iter());
++		assert_eq!(packets.len(), 1);
++		let m = DnsMessage::from_bytes(&packets[0]).unwrap();
++		assert_eq!(m.answers(), responses[0].answers());
++		assert_eq!(m.additionals(), responses[0].additionals());
++	}
+ }
