@@ -394,17 +394,21 @@ def pw_up():
               f'audio.rate={rate} node.rate=1/{rate} '
               'session.suspend-timeout-seconds=0 node.pause-on-idle=false '
               'node.suspend-on-idle=false node.always-process=true')
-    label = cfg["name"]
+    # The sound list shows the product name, like the macOS driver; the Dante
+    # name stays in node.nick.
+    label = "N-Series AoIP"
     if cfg["rx_channels"] > 0:
         # Dante RX = audio *from* the network = a PipeWire source (capture).
         run("pw-cli", "create-node", "adapter",
             "{ factory.name=api.alsa.pcm.source node.name=inferno_dvs_source "
             f'node.description="{label} (Dante in, {cfg["rx_channels"]} ch)" '
+            f'node.nick="{cfg["name"]}" '
             f"media.class=Audio/Source {common} }}", check=True)
     if cfg["tx_channels"] > 0:
         run("pw-cli", "create-node", "adapter",
             "{ factory.name=api.alsa.pcm.sink node.name=inferno_dvs_sink "
             f'node.description="{label} (Dante out, {cfg["tx_channels"]} ch)" '
+            f'node.nick="{cfg["name"]}" '
             f"media.class=Audio/Sink {common} }}", check=True)
     # pw-cli exits 0 even when the ALSA device fails to open; check for real.
     want = (cfg["rx_channels"] > 0) + (cfg["tx_channels"] > 0)

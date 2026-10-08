@@ -24,7 +24,7 @@ Under the hood it is built on:
 |---|---|
 | **Settings app** (*Inferno DVS*) | Device name, network interface, receive and transmit channel counts (0–128), sample rate (44.1/48/88.2/96 kHz), latency (0.25–40 ms), PipeWire buffer, start automatically, on/off switch, live clock status, and "use as system output/input" switches |
 | **Wingpanel indicator** | On/off switch, name, channels, IP, clock state, System Output / System Input switches, and a link to the settings app |
-| **PipeWire devices** | `<name> (Dante out, N ch)` is a sink, so audio played to it goes to the network. `<name> (Dante in, N ch)` is a source that brings audio in from the network |
+| **PipeWire devices** | `N-Series AoIP (Dante out, N ch)` is a sink, so audio played to it goes to the network. `N-Series AoIP (Dante in, N ch)` is a source that brings audio in from the network |
 | **`inferno-dvs-ctl`** | Command-line control, also used by the app and the indicator |
 
 ### Tested
@@ -199,7 +199,7 @@ To remove everything: `./uninstall.sh`. Your settings in
    enables the PTP daemon on that NIC.
 4. Wait for the clock line to say **"Locked to leader"**.
 5. Patch in Dante Controller, as with any Dante device.
-6. In your apps, pick **`<name> (Dante out/in, N ch)`**. To send all desktop
+6. In your apps, pick **`N-Series AoIP (Dante out/in, N ch)`**. To send all desktop
    audio to Dante, turn on **Use as system output**.
 
 elementary's own Sound settings and sound indicator only list hardware sound
