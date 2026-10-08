@@ -1,0 +1,183 @@
+From 5e0c9735a7ce48bb48f8afd532709e8297750152 Mon Sep 17 00:00:00 2001
+From: Nickster90s <nick.eventslight@gmail.com>
+Date: Thu, 8 Oct 2026 17:43:31 +0200
+Subject: [PATCH] List sinks and sources that have no card
+
+Virtual devices, such as the PipeWire nodes an application creates, have
+no card and so no card ports. They were never listed, so they could not be
+chosen as the default device. List each of them as a device of its own;
+choosing it sets the default sink / source directly.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/PulseAudioManager.vala | 119 +++++++++++++++++++++++++++++++++++++
+ 1 file changed, 119 insertions(+)
+
+diff --git a/src/PulseAudioManager.vala b/src/PulseAudioManager.vala
+index 7d5d973..a07d1e6 100644
+--- a/src/PulseAudioManager.vala
++++ b/src/PulseAudioManager.vala
+@@ -80,6 +80,18 @@ public class Sound.PulseAudioManager : GLib.Object {
+         debug ("\n");
+         debug ("set_default_device: %s", device.id);
+         debug ("\t%s", device.input? "input" : "output");
++
++        // A device without a card has no profiles or ports, only its sink / source
++        if (device.card_index == PulseAudio.INVALID_INDEX) {
++            if (device.input && device.source_name != default_source_name) {
++                yield set_default_source (device.source_name);
++            } else if (!device.input && device.sink_name != default_sink_name) {
++                yield set_default_sink (device.sink_name);
++            }
++
++            return;
++        }
++
+         // #1 Set card profile
+         // Some sinks / sources are only available under certain card profiles,
+         // for example to switch between onboard speakers to hdmi
+@@ -347,6 +359,7 @@ public class Sound.PulseAudioManager : GLib.Object {
+ 
+                     case PulseAudio.Context.SubscriptionEventType.REMOVE:
+                         debug ("subscribe_callback:SINK:REMOVE");
++                        remove_cardless_device (output_devices, index);
+                         foreach (var device in output_devices.values) {
+                             if (device.sink_index == index) {
+                                 debug ("\tupdating device: %s", device.id);
+@@ -428,6 +441,10 @@ public class Sound.PulseAudioManager : GLib.Object {
+ 
+                     case PulseAudio.Context.SubscriptionEventType.REMOVE:
+                         debug ("subscribe_callback:SOURCE:REMOVE");
++                        if (source_type == PulseAudio.Context.SubscriptionEventType.SOURCE) {
++                            remove_cardless_device (input_devices, index);
++                        }
++
+                         foreach (var device in input_devices.values) {
+                             if (device.source_index == index) {
+                                 debug ("\tupdating device: %s", device.id);
+@@ -475,6 +492,12 @@ public class Sound.PulseAudioManager : GLib.Object {
+             return;
+         }
+ 
++        if (source.card == PulseAudio.INVALID_INDEX) {
++            update_cardless_device (input_devices, true, source.index, source.name, source.description,
++                                    source.proplist, source.mute != 0, source.volume, source.channel_map);
++            return;
++        }
++
+         if (debug_enabled) {
+             foreach (var port in source.ports) {
+                 debug ("\t\tport: %s (%s)", port.description, port.name);
+@@ -544,6 +567,12 @@ public class Sound.PulseAudioManager : GLib.Object {
+             return;
+         }
+ 
++        if (sink.card == PulseAudio.INVALID_INDEX) {
++            update_cardless_device (output_devices, false, sink.index, sink.name, sink.description,
++                                    sink.proplist, sink.mute != 0, sink.volume, sink.channel_map);
++            return;
++        }
++
+         debug ("\t\tcard: %u", sink.card);
+         if (debug_enabled) {
+             // Assuming that if sink.active_port is null, then sink.ports is empty
+@@ -605,6 +634,96 @@ public class Sound.PulseAudioManager : GLib.Object {
+ 
+ 
+ 
++    /*
++     * Sinks and sources without a card, such as virtual devices that
++     * applications create in PipeWire, have no card ports.
++     * List each of them as a device of its own.
++     */
++    private void update_cardless_device (Gee.HashMap<string, Device> devices, bool is_input, uint32 index,
++                                         string name, string description, PulseAudio.Proplist proplist,
++                                         bool is_muted, PulseAudio.CVolume cvolume, PulseAudio.ChannelMap channel_map) {
++        var id = (is_input ? "source:" : "sink:") + name;
++        bool is_new = !devices.has_key (id);
++        Device device = null;
++        if (is_new) {
++            debug ("\t\tnew cardless device: %s", id);
++            device = new Device (id, PulseAudio.INVALID_INDEX, "");
++        } else {
++            device = devices[id];
++        }
++
++        device.input = is_input;
++        device.display_name = description;
++
++        var nick = proplist.gets ("node.nick");
++        if (nick != null && nick != "" && nick != description) {
++            device.description = nick;
++        } else {
++            device.description = is_input ? _("Input") : _("Output");
++        }
++
++        device.form_factor = proplist.gets (PulseAudio.Proplist.PROP_DEVICE_FORM_FACTOR);
++        device.icon_name = proplist.gets (PulseAudio.Proplist.PROP_DEVICE_ICON_NAME);
++        if (device.icon_name == null) {
++            device.icon_name = is_input ? "audio-input-microphone" : "audio-card";
++        }
++
++        if (is_input) {
++            device.source_name = name;
++            device.source_index = (int) index;
++            device.is_default = (name == default_source_name);
++        } else {
++            device.sink_name = name;
++            device.sink_index = (int) index;
++            device.is_default = (name == default_sink_name);
++        }
++
++        device.is_muted = is_muted;
++        device.cvolume = cvolume;
++        device.channel_map = channel_map;
++        device.balance = cvolume.get_balance (channel_map);
++        device.volume_operations.foreach ((operation) => {
++            if (operation.get_state () != PulseAudio.Operation.State.RUNNING) {
++                device.volume_operations.remove (operation);
++            }
++
++            return GLib.Source.CONTINUE;
++        });
++
++        if (device.volume_operations.is_empty) {
++            device.volume = volume_to_double (cvolume.max ());
++        }
++
++        if (device.is_default) {
++            if (is_input) {
++                default_input = device;
++            } else {
++                default_output = device;
++            }
++        }
++
++        if (is_new) {
++            devices.set (id, device);
++            new_device (device);
++        }
++    }
++
++    private void remove_cardless_device (Gee.HashMap<string, Device> devices, uint32 index) {
++        var iter = devices.map_iterator ();
++        while (iter.next ()) {
++            var device = iter.get_value ();
++            if (device.card_index != PulseAudio.INVALID_INDEX) {
++                continue;
++            }
++
++            if ((device.input ? device.source_index : device.sink_index) == (int) index) {
++                debug ("removing cardless device: %s", device.id);
++                device.removed ();
++                iter.unset ();
++            }
++        }
++    }
++
+     private void sink_input_info_callback (PulseAudio.Context c, PulseAudio.SinkInputInfo? sink_input, int eol) {
+         if (sink_input == null) {
+             return;
+-- 
+2.43.0
+

@@ -203,9 +203,16 @@ To remove everything: `./uninstall.sh`. Your settings in
    audio to Dante, turn on **Use as system output**.
 
 elementary's own Sound settings and sound indicator only list hardware sound
-cards, so the Dante devices do not show up there. Use the System Output/Input
-switches, or pick the device inside your app. Apps with their own device list
-(Ardour, Reaper, OBS, `pavucontrol`) show it directly.
+cards, so the Dante devices do not show up there
+([settings-sound#256](https://github.com/elementary/settings-sound/issues/256)).
+Use the System Output/Input switches, or pick the device inside your app. Apps
+with their own device list (Ardour, Reaper, OBS, `pavucontrol`) show it directly.
+
+To list them in elementary too, run `elementary/install.sh`. It builds the
+installed Sound settings and sound indicator with a patch that lists every
+sink and source without a card, and replaces their two libraries (the panel
+restarts by itself). An elementary update puts the originals back; run it
+again afterwards. `elementary/install.sh --restore` reinstalls the originals.
 
 ### Command line
 
