@@ -217,6 +217,53 @@ def new_process_id():
     return int.from_bytes(os.urandom(2), "big") % 65535 + 1
 
 
+def nic_device_unit(ifname):
+    return f"sys-subsystem-net-devices-{ifname}.device"
+
+
+def bind_to_nic(ifname):
+    """Tie the PipeWire nodes to the configured NIC.
+
+    A USB adapter that is unplugged or reset by USB comes back as a new
+    interface; Inferno kept its sockets on the old one and its mDNS failed
+    with "No such device", so Dante Controller lost the device. BindsTo stops
+    the nodes when the NIC goes away; the device unit's wants link starts them
+    again when it returns (removed by `stop`, so a stopped device stays off).
+    """
+    if not ifname:
+        return
+    dev = nic_device_unit(ifname)
+    drop = XDG_CONFIG / "systemd" / "user" / f"{USER_UNIT}.d"
+    f = drop / "nic.conf"
+    # no start limit: a returning adapter appears and disappears a few times
+    # (eth0 -> enx... rename, udev settings), which otherwise blocks the start
+    want = f"[Unit]\nBindsTo={dev}\nAfter={dev}\nStartLimitIntervalSec=0\n"
+    wants_dir = XDG_CONFIG / "systemd" / "user" / f"{dev}.wants"
+    link = wants_dir / USER_UNIT
+    changed = False
+    if not f.exists() or f.read_text() != want:
+        drop.mkdir(parents=True, exist_ok=True)
+        f.write_text(want)
+        changed = True
+    if not link.is_symlink():
+        wants_dir.mkdir(parents=True, exist_ok=True)
+        link.symlink_to(f"/usr/local/lib/systemd/user/{USER_UNIT}")
+        changed = True
+    # links for a NIC that is no longer configured
+    for old in (XDG_CONFIG / "systemd" / "user").glob(f"sys-subsystem-net-devices-*.device.wants/{USER_UNIT}"):
+        if old != link:
+            old.unlink()
+            changed = True
+    if changed:
+        systemctl("daemon-reload", user=True)
+
+
+def unbind_from_nic():
+    for old in (XDG_CONFIG / "systemd" / "user").glob(f"sys-subsystem-net-devices-*.device.wants/{USER_UNIT}"):
+        old.unlink()
+    systemctl("daemon-reload", user=True)
+
+
 def watch_requests(devid):
     """Point inferno-dvs-requests.path at this device's request file.
 
@@ -274,6 +321,7 @@ pcm.{PCM_NAME} {{
     CONF_DIR.mkdir(parents=True, exist_ok=True)
     ALSA_CONF.write_text(body)
     watch_requests(device_id(cfg["interface"]))
+    bind_to_nic(cfg["interface"])
 
     include = f"<{ALSA_CONF}>"
     ALSA_USER_RC.parent.mkdir(parents=True, exist_ok=True)
@@ -321,8 +369,21 @@ def pw_nodes():
     return out
 
 
+def wait_for_ipv4(ifname, timeout_s=30):
+    """Inferno binds to the NIC's IPv4 address while PipeWire opens the plugin;
+    without one it panics, which aborts PipeWire itself (all audio of the PC).
+    A USB adapter that just came back needs a few seconds for its link-local
+    address, so wait for it, and fail cleanly instead of crashing PipeWire."""
+    deadline = time.monotonic() + timeout_s
+    while not ipv4_of(ifname):
+        if time.monotonic() > deadline:
+            raise ValueError(f"{ifname} has no IPv4 address; not starting Inferno")
+        time.sleep(0.5)
+
+
 def pw_up():
     cfg = validated(load_config())
+    wait_for_ipv4(cfg["interface"])
     write_alsa_conf(cfg)
     pw_down()
     q, rate = cfg["pw_quantum"], cfg["sample_rate"]
@@ -451,6 +512,9 @@ def statime_config(ifname, out_path):
 loglevel = "warn"
 sdo-id = 0
 domain = 0
+# Never a clock source: while starting, before it heard the Leader, statime
+# could announce itself and disturb every device's timing on the network.
+slave-only = true
 priority1 = 251
 virtual-system-clock = true
 virtual-system-clock-base = "monotonic_raw"
@@ -663,6 +727,7 @@ def cmd_start():
 
 
 def cmd_stop():
+    unbind_from_nic()
     systemctl("stop", USER_UNIT, user=True)
 
 

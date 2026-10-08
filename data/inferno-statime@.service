@@ -1,8 +1,11 @@
 [Unit]
 Description=Statime PTPv1 follower for Inferno DVS on %i
 Documentation=https://github.com/teodly/statime/tree/inferno-dev
-After=network-online.target
+After=network-online.target sys-subsystem-net-devices-%i.device
 Wants=network-online.target
+# Follow the NIC: stop when a USB adapter goes away (unplugged or reset by
+# USB), start again when it comes back.
+BindsTo=sys-subsystem-net-devices-%i.device
 
 [Service]
 Type=simple
@@ -15,4 +18,4 @@ RestartSec=2
 Nice=-10
 
 [Install]
-WantedBy=multi-user.target
+WantedBy=multi-user.target sys-subsystem-net-devices-%i.device
