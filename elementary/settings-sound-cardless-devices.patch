@@ -1,4 +1,4 @@
-From 5e0c9735a7ce48bb48f8afd532709e8297750152 Mon Sep 17 00:00:00 2001
+From 54944e54d00ec183c8d6f0d49ac74166593aab36 Mon Sep 17 00:00:00 2001
 From: Nickster90s <nick.eventslight@gmail.com>
 Date: Thu, 8 Oct 2026 17:43:31 +0200
 Subject: [PATCH] List sinks and sources that have no card
@@ -10,11 +10,11 @@ choosing it sets the default sink / source directly.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
- src/PulseAudioManager.vala | 119 +++++++++++++++++++++++++++++++++++++
- 1 file changed, 119 insertions(+)
+ src/PulseAudioManager.vala | 120 +++++++++++++++++++++++++++++++++++++
+ 1 file changed, 120 insertions(+)
 
 diff --git a/src/PulseAudioManager.vala b/src/PulseAudioManager.vala
-index 7d5d973..a07d1e6 100644
+index 7d5d973..1a559e4 100644
 --- a/src/PulseAudioManager.vala
 +++ b/src/PulseAudioManager.vala
 @@ -80,6 +80,18 @@ public class Sound.PulseAudioManager : GLib.Object {
@@ -81,7 +81,7 @@ index 7d5d973..a07d1e6 100644
          debug ("\t\tcard: %u", sink.card);
          if (debug_enabled) {
              // Assuming that if sink.active_port is null, then sink.ports is empty
-@@ -605,6 +634,96 @@ public class Sound.PulseAudioManager : GLib.Object {
+@@ -605,6 +634,97 @@ public class Sound.PulseAudioManager : GLib.Object {
  
  
  
@@ -119,6 +119,12 @@ index 7d5d973..a07d1e6 100644
 +            device.icon_name = is_input ? "audio-input-microphone" : "audio-card";
 +        }
 +
++        // Add it before it becomes the default, so the list sees the change
++        if (is_new) {
++            devices.set (id, device);
++            new_device (device);
++        }
++
 +        if (is_input) {
 +            device.source_name = name;
 +            device.source_index = (int) index;
@@ -151,11 +157,6 @@ index 7d5d973..a07d1e6 100644
 +            } else {
 +                default_output = device;
 +            }
-+        }
-+
-+        if (is_new) {
-+            devices.set (id, device);
-+            new_device (device);
 +        }
 +    }
 +

@@ -1,4 +1,4 @@
-From 2fdfe3ca20809244944455e12336d30b23589d60 Mon Sep 17 00:00:00 2001
+From 33772de8792a685c09b07c9936427a1e356557d5 Mon Sep 17 00:00:00 2001
 From: Nickster90s <nick.eventslight@gmail.com>
 Date: Thu, 8 Oct 2026 17:43:31 +0200
 Subject: [PATCH] List sinks and sources that have no card
@@ -10,11 +10,11 @@ choosing it sets the default sink / source directly.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
- src/Services/PulseAudioManager.vala | 94 +++++++++++++++++++++++++++++
- 1 file changed, 94 insertions(+)
+ src/Services/PulseAudioManager.vala | 95 +++++++++++++++++++++++++++++
+ 1 file changed, 95 insertions(+)
 
 diff --git a/src/Services/PulseAudioManager.vala b/src/Services/PulseAudioManager.vala
-index b3489ce..762bd07 100644
+index b3489ce..92a54a8 100644
 --- a/src/Services/PulseAudioManager.vala
 +++ b/src/Services/PulseAudioManager.vala
 @@ -75,6 +75,18 @@ public class Sound.PulseAudioManager : GLib.Object {
@@ -82,7 +82,7 @@ index b3489ce..762bd07 100644
          debug ("\t\tcard: %u", sink.card);
          if (debug_enabled) {
              // Assuming that if sink.active_port is null, then sink.ports is empty
-@@ -484,6 +514,70 @@ public class Sound.PulseAudioManager : GLib.Object {
+@@ -484,6 +514,71 @@ public class Sound.PulseAudioManager : GLib.Object {
          }
      }
  
@@ -112,6 +112,12 @@ index b3489ce..762bd07 100644
 +            device.icon_name = direction == INPUT ? "audio-input-microphone" : "audio-card";
 +        }
 +
++        // Add it before it becomes the default, so the list sees the change
++        if (is_new) {
++            devices.set (id, device);
++            new_device (device);
++        }
++
 +        if (direction == INPUT) {
 +            device.source_name = name;
 +            device.source_index = (int) index;
@@ -126,11 +132,6 @@ index b3489ce..762bd07 100644
 +            if (device.is_default) {
 +                default_output = device;
 +            }
-+        }
-+
-+        if (is_new) {
-+            devices.set (id, device);
-+            new_device (device);
 +        }
 +    }
 +
