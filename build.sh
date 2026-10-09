@@ -1,7 +1,7 @@
 #!/bin/bash
 # Build everything:
 #   1. fetch Inferno + the Statime inferno-dev fork at tested commits (deps/)
-#   2. apply our Inferno patches (patches/)
+#   2. apply our Inferno patches (patches/) and Statime patches (patches/statime/)
 #   3. cargo build the Inferno ALSA plugin and Statime
 #   4. meson build the settings app and the Wingpanel indicator
 # Install afterwards with ./install.sh.
@@ -30,30 +30,35 @@ mkdir -p "$here/deps"
 [ -n "${INFERNO_DIR:-}" ] || fetch "$INFERNO_URL" "$INFERNO_REV" "$inferno"
 [ -n "${STATIME_DIR:-}" ] || fetch "$STATIME_URL" "$STATIME_REV" "$statime"
 
-if [ -z "${INFERNO_DIR:-}" ]; then
-    # Our own checkout: start from the pinned commit every time, so changed
-    # patches never meet an older version of themselves.
-    git -C "$inferno" reset -q --hard "$INFERNO_REV"
-    git -C "$inferno" submodule -q foreach --recursive git reset -q --hard
-    git -C "$inferno" submodule -q update --init --recursive
-    for p in "$here"/patches/*.patch; do
-        echo "applying $(basename "$p")"
-        git -C "$inferno" apply "$p"
-    done
-else
-    # Someone else's checkout: apply what is missing, never reset it.
-    for p in "$here"/patches/*.patch; do
-        if git -C "$inferno" apply --check "$p" 2>/dev/null; then
+apply_patches() {  # repo rev patchdir own-checkout(1/0)
+    if [ "$4" = 1 ]; then
+        # Our own checkout: start from the pinned commit every time, so changed
+        # patches never meet an older version of themselves.
+        git -C "$1" reset -q --hard "$2"
+        git -C "$1" submodule -q foreach --recursive git reset -q --hard
+        git -C "$1" submodule -q update --init --recursive
+        for p in "$3"/*.patch; do
             echo "applying $(basename "$p")"
-            git -C "$inferno" apply "$p"
-        elif git -C "$inferno" apply --check --reverse "$p" 2>/dev/null; then
-            echo "already applied: $(basename "$p")"
-        else
-            echo "error: $(basename "$p") does not apply to $inferno" >&2
-            exit 1
-        fi
-    done
-fi
+            git -C "$1" apply "$p"
+        done
+    else
+        # Someone else's checkout: apply what is missing, never reset it.
+        for p in "$3"/*.patch; do
+            if git -C "$1" apply --check "$p" 2>/dev/null; then
+                echo "applying $(basename "$p")"
+                git -C "$1" apply "$p"
+            elif git -C "$1" apply --check --reverse "$p" 2>/dev/null; then
+                echo "already applied: $(basename "$p")"
+            else
+                echo "error: $(basename "$p") does not apply to $1" >&2
+                exit 1
+            fi
+        done
+    fi
+}
+
+apply_patches "$inferno" "$INFERNO_REV" "$here/patches" "$([ -z "${INFERNO_DIR:-}" ] && echo 1 || echo 0)"
+apply_patches "$statime" "$STATIME_REV" "$here/patches/statime" "$([ -z "${STATIME_DIR:-}" ] && echo 1 || echo 0)"
 
 (cd "$inferno" && "$cargo" build --release -p alsa_pcm_inferno)
 (cd "$statime" && "$cargo" build --release -p statime-linux)

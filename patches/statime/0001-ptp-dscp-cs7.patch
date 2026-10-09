@@ -1,0 +1,60 @@
+diff --git a/statime-linux/src/socket.rs b/statime-linux/src/socket.rs
+index c9cc430..c8a4b39 100644
+--- a/statime-linux/src/socket.rs
++++ b/statime-linux/src/socket.rs
+@@ -24,6 +24,10 @@ const GENERAL_PORT: u16 = 320;
+ 
+ const PTP_ETHERTYPE: u16 = 0x88f7;
+ 
++/// Dante's QoS class for PTP (DSCP CS7, 56): the highest priority on switches
++/// with QoS enabled, ahead of audio (EF, 46)
++const DSCP_PTP: u8 = 56;
++
+ pub trait PtpTargetAddress {
+     const PRIMARY_EVENT: Self;
+     const PRIMARY_GENERAL: Self;
+@@ -66,6 +70,7 @@ pub fn open_ipv4_event_socket(
+     bind_phc: Option<u32>,
+ ) -> std::io::Result<Socket<SocketAddrV4, Open>> {
+     let socket = open_interface_udp4(interface, EVENT_PORT, timestamping, bind_phc)?;
++    socket.set_dscp(DSCP_PTP)?;
+     socket.join_multicast(SocketAddrV4::new(IPV4_PRIMARY_MULTICAST, 0), interface)?;
+     socket.join_multicast(SocketAddrV4::new(IPV4_PDELAY_MULTICAST, 0), interface)?;
+     Ok(socket)
+@@ -75,6 +80,7 @@ pub fn open_ipv4_general_socket(
+     interface: InterfaceName,
+ ) -> std::io::Result<Socket<SocketAddrV4, Open>> {
+     let socket = open_interface_udp4(interface, GENERAL_PORT, InterfaceTimestampMode::None, None)?;
++    socket.set_dscp(DSCP_PTP)?;
+     socket.join_multicast(SocketAddrV4::new(IPV4_PRIMARY_MULTICAST, 0), interface)?;
+     socket.join_multicast(SocketAddrV4::new(IPV4_PDELAY_MULTICAST, 0), interface)?;
+     Ok(socket)
+diff --git a/timestamped-socket/src/socket.rs b/timestamped-socket/src/socket.rs
+index 946a1b8..2d09d65 100644
+--- a/timestamped-socket/src/socket.rs
++++ b/timestamped-socket/src/socket.rs
+@@ -256,6 +256,24 @@ impl<A: NetworkAddress> Socket<A, Connected> {
+     }
+ }
+ 
++impl<A: NetworkAddress, S> Socket<A, S> {
++    /// Marks packets sent from this (IPv4) socket with a DSCP value.
++    pub fn set_dscp(&self, dscp: u8) -> std::io::Result<()> {
++        let tos: libc::c_int = (dscp as libc::c_int) << 2;
++        // Safety: tos lives for the duration of the call and we pass its size
++        crate::cerr(unsafe {
++            libc::setsockopt(
++                self.socket.get_ref().as_raw_fd(),
++                libc::IPPROTO_IP,
++                libc::IP_TOS,
++                &tos as *const _ as *const libc::c_void,
++                std::mem::size_of_val(&tos) as libc::socklen_t,
++            )
++        })?;
++        Ok(())
++    }
++}
++
+ impl<A: MulticastJoinable, S> Socket<A, S> {
+     pub fn join_multicast(&self, addr: A, interface: InterfaceName) -> std::io::Result<()> {
+         addr.join_multicast(self.socket.get_ref().as_raw_fd(), interface, PrivateToken)

@@ -276,6 +276,20 @@ Controller changes them, Inferno answers at once and writes
 `inferno-dvs-ctl apply-requests`, which updates your settings and restarts the
 PipeWire nodes on the new value.
 
+`patches/0009-usrvclock-reconnect-after-statime-restart.patch` lets Inferno
+survive a Statime restart. Inferno gets PTP time from Statime over the
+`/tmp/ptp-usrvclock` socket. A restarted Statime binds a new socket there, and
+Inferno kept waiting on the old one: no more clock updates, so the audio it sent
+went bad until PipeWire was restarted, while the network side looked clean
+(nothing late, only the receivers' measured latency moved). Now Inferno
+re-registers after 3 s without an update. A test in `usrvclock-rs` restarts the
+server under a running client.
+
+`patches/statime/0001-ptp-dscp-cs7.patch` marks Statime's PTP packets DSCP CS7
+(56), Dante's class for PTP, as the macOS engine's Statime already does.
+`build.sh` applies `patches/statime/*.patch` to Statime the way it applies
+`patches/*.patch` to Inferno.
+
 `patches/0008-mdns-paced-responses.patch` stops searchfire's mDNS bursts.
 A Dante receiver refreshing its cache asks about every channel in one query
 (every ~96 s), and searchfire answered each question with its own packet: 60+

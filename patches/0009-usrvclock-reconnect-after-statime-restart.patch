@@ -1,0 +1,70 @@
+diff --git a/usrvclock-rs/src/lib.rs b/usrvclock-rs/src/lib.rs
+index 944925c..f139f01 100644
+--- a/usrvclock-rs/src/lib.rs
++++ b/usrvclock-rs/src/lib.rs
+@@ -270,6 +270,11 @@ impl SafeClock {
+ }
+ 
+ 
++/// How long the async client waits for an update before it registers with the
++/// server again, in case the server was restarted
++#[cfg(feature="tokio")]
++const RECONNECT_AFTER_SILENCE: Duration = Duration::from_secs(3);
++
+ /// Default path to usrvclock datagram Unix-domain socket
+ pub const DEFAULT_SERVER_SOCKET_PATH: &str = "/tmp/ptp-usrvclock";
+ 
+@@ -486,8 +491,12 @@ impl AsyncClient {
+                         }
+                         if let Some((socket, local_path)) = &socket_opt {
+                             let mut buff = [0u8; OVERLAY_SIZE_BYTES];
+-                            match socket.recv(&mut buff).await {
+-                                Ok(size) => {
++                            // A restarted server binds a new socket at the same path and
++                            // never hears of this one: recv() waits forever on the dead
++                            // peer and the clock free-runs. The server sends every clock
++                            // update (several a second), so silence means re-register.
++                            match tokio::time::timeout(RECONNECT_AFTER_SILENCE, socket.recv(&mut buff)).await {
++                                Ok(Ok(size)) => {
+                                     match ClockOverlay::decode(&buff[0..size]) {
+                                         Ok(v) => {
+                                             let _ = tx.send(Some(v));
+@@ -571,6 +580,38 @@ mod tests {
+     }
+ 
+     #[cfg(feature="tokio")]
++    #[tokio::test]
++    async fn tokio_reconnects_after_server_restart() {
++        let path = "/tmp/usrvclock-test-tokio-restart";
++        let overlay = |shift| ClockOverlay { clock_id: 33, last_sync: 0, shift, freq_scale: 0.0 };
++        let server_thr = std::thread::spawn(move || {
++            let mut first = Server::new(path.into()).unwrap();
++            for _ in 0..8 {
++                std::thread::sleep(Duration::from_millis(250));
++                first.send(overlay(1));
++            }
++            drop(first);
++            // statime restarted: a new server at the same path, which has
++            // never heard of the client
++            let mut second = Server::new(path.into()).unwrap();
++            for _ in 0..40 {
++                std::thread::sleep(Duration::from_millis(250));
++                second.send(overlay(2));
++            }
++        });
++        let client = AsyncClient::start(path.into(), Box::new(|e| panic!("{e:?}")));
++        let mut receiver = client.subscribe();
++        let got_second = tokio::time::timeout(Duration::from_secs(8), async {
++            loop {
++                receiver.changed().await.unwrap();
++                if receiver.borrow().unwrap().shift == 2 { break; }
++            }
++        }).await;
++        assert!(got_second.is_ok(), "client never heard the restarted server");
++        client.stop().await.unwrap();
++        server_thr.join().unwrap();
++    }
++
+     #[tokio::test]
+     async fn tokio_send_recv() {
+         let test_overlay = ClockOverlay {
