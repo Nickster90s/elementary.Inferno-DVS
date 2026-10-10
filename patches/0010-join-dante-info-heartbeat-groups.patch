@@ -1,0 +1,42 @@
+diff --git a/inferno_aoip/src/device_server/info_mcast_server.rs b/inferno_aoip/src/device_server/info_mcast_server.rs
+index f83b9bb..67b7165 100644
+--- a/inferno_aoip/src/device_server/info_mcast_server.rs
++++ b/inferno_aoip/src/device_server/info_mcast_server.rs
+@@ -556,6 +556,18 @@ pub async fn run_server(
+ ) {
+   let server =
+     UdpSocketWrapper::new(Some(self_info.ip_address), self_info.info_request_port, shutdown).await;
++  // Dante devices join the groups they announce on, and 239.255.255.255, the
++  // group Luminex Araneo's IGMP tab files a device under "Dante" by. Switches
++  // flood 224.0.0.x anyway; 239.255.255.255 carried ~8 kbit/s on the bench.
++  for group in [
++    Ipv4Addr::new(224, 0, 0, 231),
++    Ipv4Addr::new(224, 0, 0, 233),
++    Ipv4Addr::new(239, 255, 255, 255),
++  ] {
++    if let Err(e) = server.join_multicast_v4(group, self_info.ip_address) {
++      warn!("cannot join {group}: {e}");
++    }
++  }
+   let mut recv_buff = crate::net_utils::ReceiveBuffer::new();
+   let mut mcaster = Multicaster::new(self_info.as_ref(), server, clock, get_peaks);
+   mcaster.send_board_info().await;
+diff --git a/inferno_aoip/src/util/net.rs b/inferno_aoip/src/util/net.rs
+index 9c69ca8..ef94116 100644
+--- a/inferno_aoip/src/util/net.rs
++++ b/inferno_aoip/src/util/net.rs
+@@ -71,6 +71,14 @@ impl UdpSocketWrapper {
+     self.listen_port
+   }
+ 
++  /// Joins a multicast group (sends the IGMP report) for as long as the socket is open.
++  pub fn join_multicast_v4(&self, group: Ipv4Addr, interface: Ipv4Addr) -> std::io::Result<()> {
++    match &self.socket {
++      Some(s) => s.join_multicast_v4(group, interface),
++      None => Ok(()),
++    }
++  }
++
+   pub async fn recv<'a>(&mut self, recv_buff: &'a mut ReceiveBuffer) -> Option<(SocketAddr, &'a [u8])> {
+     let socket = match &self.socket {
+       Some(s) => s,

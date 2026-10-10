@@ -276,6 +276,11 @@ Controller changes them, Inferno answers at once and writes
 `inferno-dvs-ctl apply-requests`, which updates your settings and restarts the
 PipeWire nodes on the new value.
 
+`patches/0010-join-dante-info-heartbeat-groups.patch` makes Inferno join
+224.0.0.231, 224.0.0.233 and 239.255.255.255 as Dante devices do. Switches
+flood 224.0.0.x anyway, but Luminex Araneo's IGMP tab lists a device under
+"Dante" only with these joins.
+
 `patches/0009-usrvclock-reconnect-after-statime-restart.patch` lets Inferno
 survive a Statime restart. Inferno gets PTP time from Statime over the
 `/tmp/ptp-usrvclock` socket. A restarted Statime binds a new socket there, and
