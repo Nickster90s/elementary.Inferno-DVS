@@ -1,0 +1,34 @@
+diff --git a/timestamped-socket/src/raw_socket/linux.rs b/timestamped-socket/src/raw_socket/linux.rs
+index 2fe83ac..bcbe572 100644
+--- a/timestamped-socket/src/raw_socket/linux.rs
++++ b/timestamped-socket/src/raw_socket/linux.rs
+@@ -90,12 +90,28 @@ impl RawSocket {
+     }
+ 
+     pub(crate) fn ip_multicast_if(&self, interface_name: InterfaceName) -> std::io::Result<()> {
++        // Name the interface's own IPv4 address too: with only the index, the
++        // kernel picks the source address by scope, and a link-local
++        // 169.254.x.x (scope link) does not qualify for 224.0.1.129, so
++        // packets left with another interface's address (an office-LAN
++        // 192.168.1.80 on the Dante network).
++        let source = crate::interface::interfaces()
++            .ok()
++            .and_then(|all| {
++                all.get(&interface_name).and_then(|data| {
++                    data.ips().find_map(|ip| match ip {
++                        std::net::IpAddr::V4(v4) => Some(v4),
++                        _ => None,
++                    })
++                })
++            })
++            .unwrap_or(Ipv4Addr::UNSPECIFIED);
+         let request = libc::ip_mreqn {
+             imr_multiaddr: libc::in_addr {
+                 s_addr: u32::from_ne_bytes(Ipv4Addr::UNSPECIFIED.octets()),
+             },
+             imr_address: libc::in_addr {
+-                s_addr: u32::from_ne_bytes(Ipv4Addr::UNSPECIFIED.octets()),
++                s_addr: u32::from_ne_bytes(source.octets()),
+             },
+             imr_ifindex: interface_name
+                 .get_index()

@@ -295,6 +295,13 @@ server under a running client.
 `build.sh` applies `patches/statime/*.patch` to Statime the way it applies
 `patches/*.patch` to Inferno.
 
+`patches/statime/0002-ptp-multicast-source-address.patch` makes Statime send
+from the Dante interface's own address. Linux does not use a link-local
+169.254.x.x address (scope link) as the source for 224.0.1.129, so Statime's
+Delay_Req left the Dante port with another interface's address, here the
+office LAN's 192.168.1.80. The leader answered anyway, but the network saw a
+stray device. The patch names the interface address in `IP_MULTICAST_IF`.
+
 `patches/0008-mdns-paced-responses.patch` stops searchfire's mDNS bursts.
 A Dante receiver refreshing its cache asks about every channel in one query
 (every ~96 s), and searchfire answered each question with its own packet: 60+
